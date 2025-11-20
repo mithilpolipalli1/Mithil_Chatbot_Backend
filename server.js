@@ -45,8 +45,14 @@ function parseMenuChoice(text) {
   if (["1", "book", "book appointment"].includes(t)) return "book";
   if (["2", "view", "view appointments"].includes(t)) return "view";
   if (
-    ["3", "modify", "modify appointment", "reschedule", "reschedule / cancel", "reschedule/cancel"]
-      .includes(t)
+    [
+      "3",
+      "modify",
+      "modify appointment",
+      "reschedule",
+      "reschedule / cancel",
+      "reschedule/cancel",
+    ].includes(t)
   )
     return "modify";
 
@@ -704,8 +710,7 @@ app.post("/chat", async (req, res) => {
 /* ---------------------------------
    WHATSAPP WEBHOOK (stub for now)
    - GET /webhook : verification
-   - POST /webhook: basic echo reply
-   - Later we can hook into same flow
+   - POST /webhook: basic reply
 -----------------------------------*/
 
 // Verification endpoint for Meta
