@@ -1,14 +1,19 @@
 // server.js
 import express from "express";
 import cors from "cors";
+import axios from "axios";
+import dotenv from "dotenv";
 import { pool, connectDB } from "./db.js";
 
+dotenv.config();
+
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
 /* ---------------------------------
-   CONSTANTS & HELPERS
+   HELPERS & CONSTANTS
 -----------------------------------*/
 
 function getGreeting() {
@@ -18,7 +23,7 @@ function getGreeting() {
   return "Good Evening";
 }
 
-// Services: names as keys for easy lookup
+// All services with prices (names used everywhere)
 const SERVICE_PRICES = {
   "Haircut": 300,
   "Facial": 400,
@@ -34,13 +39,27 @@ const BRANCHES = {
   4: "Banjara Hills",
 };
 
-// Utility to build a response object
-function respond(reply, nextStep, extra = {}) {
+// Main-menu choice parser
+function parseMenuChoice(text) {
+  const t = (text || "").toString().trim().toLowerCase();
+  if (["1", "book", "book appointment"].includes(t)) return "book";
+  if (["2", "view", "view appointments"].includes(t)) return "view";
+  if (
+    ["3", "modify", "modify appointment", "reschedule", "reschedule / cancel", "reschedule/cancel"]
+      .includes(t)
+  )
+    return "modify";
+
+  return null;
+}
+
+// Basic response helper
+function makeReply(reply, nextStep, extra = {}) {
   return { reply, nextStep, ...extra };
 }
 
-// Restart flow back to main menu
-function restart(reply, phone) {
+// Restart chat loop
+function restartSession(reply, phone) {
   return {
     reply:
       `${reply}\n\n🔁 Session restarted.\n\n👇 Choose what to do next:`,
@@ -49,30 +68,9 @@ function restart(reply, phone) {
   };
 }
 
-// calculate total price for a list of service names
-function calculateTotalPrice(services = []) {
-  return services.reduce(
-    (sum, s) => sum + (SERVICE_PRICES[s] || 0),
-    0
-  );
-}
-
-// parse main menu choice string
-function parseMenu(text) {
-  const t = text.trim().toLowerCase();
-  if (["1", "book", "book appointment"].includes(t)) return "book";
-  if (["2", "view", "view appointments"].includes(t)) return "view";
-  if (
-    ["3", "modify", "reschedule", "reschedule / cancel", "reschedule/cancel"]
-      .includes(t)
-  )
-    return "modify";
-  return null;
-}
-
-// parse DD-MM-YYYY within next 30 days
-function parseDate(text) {
-  const parts = text.split(/[-/]/);
+// Parse DD-MM-YYYY within next 30 days
+function parseDateDDMMYYYY(text) {
+  const parts = text.trim().split(/[-/]/);
   if (parts.length !== 3) return null;
 
   const [dd, mm, yyyy] = parts.map(Number);
@@ -90,7 +88,6 @@ function parseDate(text) {
 
   const max = new Date();
   max.setDate(max.getDate() + 30);
-
   d.setHours(0, 0, 0, 0);
 
   if (d < today || d > max) return null;
@@ -98,18 +95,20 @@ function parseDate(text) {
   return d;
 }
 
-// parse "4PM" / "10AM" / "16" etc
+// Parse time (10–22 allowed) like "4PM" or "16"
 function parseTime(text) {
   if (!text) return null;
-  let t = text.trim().toUpperCase().replace(/\s+/g, "");
+  let t = text.toString().trim().toUpperCase().replace(/\s+/g, "");
 
-  // e.g. 4PM, 10AM, 12PM
+  // 4PM, 10AM, 12PM
   let match = t.match(/^(\d{1,2})(AM|PM)$/);
   if (match) {
     let h = Number(match[1]);
     const ampm = match[2];
-    let hour24 = h;
 
+    if (h < 1 || h > 12) return null;
+
+    let hour24 = h;
     if (ampm === "PM" && h !== 12) hour24 += 12;
     if (ampm === "AM" && h === 12) hour24 = 0;
 
@@ -119,7 +118,7 @@ function parseTime(text) {
     return { hour24, label };
   }
 
-  // e.g. 16
+  // 16 (24h)
   match = t.match(/^(\d{1,2})$/);
   if (match) {
     const hour24 = Number(match[1]);
@@ -133,32 +132,43 @@ function parseTime(text) {
   return null;
 }
 
+// Calculate total price from array of service names
+function calculateTotalPrice(services = []) {
+  return services.reduce(
+    (sum, name) => sum + (SERVICE_PRICES[name] || 0),
+    0
+  );
+}
+
 /* ---------------------------------
-   MAIN CHAT ROUTE
+   WEBSITE CHAT ENDPOINT (/chat)
+   - This is what your frontend uses
 -----------------------------------*/
 
 app.post("/chat", async (req, res) => {
   try {
     let { text, step, phone, tempBooking } = req.body;
-    text = (text || "").trim();
+
+    text = (text || "").toString().trim();
     step = step || "phone";
 
-    // tempBooking holds session state for booking / modify
+    // tempBooking stores current booking/modify state
     tempBooking = tempBooking || {};
     tempBooking.services = tempBooking.services || [];
 
-    /* STEP: PHONE LOGIN */
+    /* STEP: phone (login / register) */
     if (step === "phone") {
       const digits = text.replace(/\D/g, "");
       if (digits.length !== 10) {
         return res.json(
-          respond("Please enter a valid 10-digit phone number.", "phone")
+          makeReply("Please enter a valid 10-digit phone number.", "phone")
         );
       }
 
       phone = digits;
+
       const result = await pool.query(
-        "SELECT * FROM salon_users WHERE phone=$1",
+        "SELECT * FROM salon_users WHERE phone = $1",
         [phone]
       );
 
@@ -167,96 +177,100 @@ app.post("/chat", async (req, res) => {
         const greet = getGreeting();
 
         return res.json(
-          respond(
-            `${greet} ${user.name.toLowerCase()}! 👋\n👇 Choose an option:`,
+          makeReply(
+            `${greet} ${user.name.toLowerCase()}! 👋\n👇 Choose an option below:`,
             "mainMenu",
             { phone }
           )
         );
+      } else {
+        return res.json(
+          makeReply(
+            "You're new here 🌟 What's your good name?",
+            "newUserName",
+            { phone }
+          )
+        );
       }
-
-      // New user
-      return res.json(
-        respond("You're new here 🌟 What's your good name?", "newUserName", {
-          phone,
-        })
-      );
     }
 
-    /* STEP: NEW USER NAME */
+    /* STEP: new user name */
     if (step === "newUserName") {
       const name = text || "Guest";
 
       await pool.query(
-        "INSERT INTO salon_users (phone, name) VALUES ($1,$2)",
+        "INSERT INTO salon_users (phone, name) VALUES ($1,$2) ON CONFLICT (phone) DO UPDATE SET name=EXCLUDED.name",
         [phone, name]
       );
 
       const greet = getGreeting();
 
       return res.json(
-        respond(
-          `${greet} ${name.toLowerCase()}! 👋\n🎉 You get **50% OFF on your first service!**\n\n👇 Choose an option:`,
+        makeReply(
+          `${greet} ${name.toLowerCase()}! 👋\n🎉 You get **50% OFF on your first service!**\n\n👇 Choose an option below:`,
           "mainMenu",
           { phone }
         )
       );
     }
 
-    /* STEP: MAIN MENU */
+    /* STEP: main menu */
     if (step === "mainMenu") {
-      const choice = parseMenu(text);
+      const choice = parseMenuChoice(text);
 
       if (!choice) {
         return res.json(
-          respond("👇 Please choose an option below.", "mainMenu", { phone })
+          makeReply("👇 Please choose an option below.", "mainMenu", { phone })
         );
       }
 
-      // New booking
+      // BOOK new appointment
       if (choice === "book") {
-        // new mode
         tempBooking = {
-          mode: "new",
-          modifyType: null,
+          mode: "new",       // new | modify
+          modifyType: null,  // services | branch | date | time | all
           services: [],
         };
 
         return res.json(
-          respond(
-            "Which services do you want?\n\nTap to select, then press Done.",
+          makeReply(
+            "Which services do you want?\n\nTap to select, then press Done ✅.",
             "bookService",
             { phone, tempBooking }
           )
         );
       }
 
-      // View appointments
+      // VIEW appointments
       if (choice === "view") {
         const result = await pool.query(
-          `SELECT services, location, appointment_date, appointment_time, total_price
+          `SELECT services, location, appointment_date, appointment_time, total_price, status
            FROM appointments
-           WHERE customer_phone=$1
+           WHERE customer_phone = $1
            ORDER BY appointment_date, appointment_time`,
           [phone]
         );
 
         if (!result.rows.length) {
           return res.json(
-            respond("📭 You have no appointments yet.", "mainMenu", { phone })
+            makeReply(
+              "📭 You have no appointments yet.",
+              "mainMenu",
+              { phone }
+            )
           );
         }
 
-        const lines = result.rows.map((r, i) => {
-          const d = r.appointment_date.toISOString().split("T")[0];
-          const price = r.total_price ? ` - ₹${r.total_price}` : "";
-          return `${i + 1}) ${r.services} at ${r.location} on ${d} ${
-            r.appointment_time
-          }${price}`;
+        const lines = result.rows.map((row, idx) => {
+          const d = row.appointment_date.toISOString().split("T")[0];
+          const price = row.total_price ? ` - ₹${row.total_price}` : "";
+          return `${idx + 1}) ${row.services} at ${row.location} on ${d} ${
+            row.appointment_time
+          } (${row.status}${price})`;
         });
 
         return res.json(
-          respond(
+          makeReply(
             `📋 Your appointments:\n\n${lines.join("\n")}`,
             "mainMenu",
             { phone }
@@ -264,34 +278,36 @@ app.post("/chat", async (req, res) => {
         );
       }
 
-      // Reschedule / Cancel / Modify
+      // MODIFY / RESCHEDULE / CANCEL
       if (choice === "modify") {
         const result = await pool.query(
           `SELECT appointment_id, services, location, appointment_date, appointment_time, total_price
            FROM appointments
-           WHERE customer_phone=$1
+           WHERE customer_phone = $1
            ORDER BY appointment_date, appointment_time`,
           [phone]
         );
 
         if (!result.rows.length) {
           return res.json(
-            respond("📭 You have no appointments to modify.", "mainMenu", {
-              phone,
-            })
+            makeReply(
+              "📭 You have no appointments to modify.",
+              "mainMenu",
+              { phone }
+            )
           );
         }
 
-        const lines = result.rows.map((r, i) => {
-          const d = r.appointment_date.toISOString().split("T")[0];
-          const price = r.total_price ? ` - ₹${r.total_price}` : "";
-          return `${i + 1}) ${r.services} at ${r.location} on ${d} ${
-            r.appointment_time
+        const lines = result.rows.map((row, idx) => {
+          const d = row.appointment_date.toISOString().split("T")[0];
+          const price = row.total_price ? ` - ₹${row.total_price}` : "";
+          return `${idx + 1}) ${row.services} at ${row.location} on ${d} ${
+            row.appointment_time
           }${price}`;
         });
 
         return res.json(
-          respond(
+          makeReply(
             `🛠 Select an appointment to modify:\n\n${lines.join("\n")}`,
             "modifyPick",
             { phone }
@@ -300,20 +316,21 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    /* STEP: PICK APPOINTMENT TO MODIFY */
+    /* STEP: pick appointment to modify */
     if (step === "modifyPick") {
+      const idx = Number(text) - 1;
+
       const result = await pool.query(
         `SELECT appointment_id, services, location, appointment_date, appointment_time, total_price
          FROM appointments
-         WHERE customer_phone=$1
+         WHERE customer_phone = $1
          ORDER BY appointment_date, appointment_time`,
         [phone]
       );
 
-      const idx = Number(text) - 1;
       if (Number.isNaN(idx) || idx < 0 || idx >= result.rows.length) {
         return res.json(
-          respond("❌ Invalid number. Try again.", "modifyPick", { phone })
+          makeReply("❌ Invalid number. Try again.", "modifyPick", { phone })
         );
       }
 
@@ -323,7 +340,9 @@ app.post("/chat", async (req, res) => {
         mode: "modify",
         modifyType: null,
         appointmentId: appt.appointment_id,
-        services: appt.services ? appt.services.split(", ").filter(Boolean) : [],
+        services: appt.services
+          ? appt.services.split(",").map(s => s.trim()).filter(Boolean)
+          : [],
         location: appt.location,
         dateISO: appt.appointment_date.toISOString().split("T")[0],
         timeLabel: appt.appointment_time,
@@ -340,58 +359,60 @@ app.post("/chat", async (req, res) => {
 7) Back`;
 
       return res.json(
-        respond(msg, "modifyMenu", { phone, tempBooking })
+        makeReply(msg, "modifyMenu", { phone, tempBooking })
       );
     }
 
-    /* STEP: MODIFY MENU */
+    /* STEP: modify menu */
     if (step === "modifyMenu") {
       const choice = text.trim();
 
       switch (choice) {
-        case "1": // services
+        case "1": // change services only
           tempBooking.modifyType = "services";
-          // existing services will show as pre-selected in UI
           return res.json(
-            respond(
-              "Select new services (tap to toggle) and press Done.",
+            makeReply(
+              "Select new services (tap to toggle) and press Done ✅.",
               "bookService",
               { phone, tempBooking }
             )
           );
 
-        case "2": // branch
+        case "2": // change branch
           tempBooking.modifyType = "branch";
           return res.json(
-            respond("Choose new branch:", "bookBranch", {
-              phone,
-              tempBooking,
-            })
+            makeReply(
+              "Choose a new branch:\n1) Miyapur\n2) Madhapur\n3) Jubilee Hills\n4) Banjara Hills",
+              "bookBranch",
+              { phone, tempBooking }
+            )
           );
 
-        case "3": // date
+        case "3": // change date
           tempBooking.modifyType = "date";
           return res.json(
-            respond("Select new date (DD-MM-YYYY):", "bookDate", {
-              phone,
-              tempBooking,
-            })
+            makeReply(
+              "Select new date (DD-MM-YYYY, within next 30 days).",
+              "bookDate",
+              { phone, tempBooking }
+            )
           );
 
-        case "4": // time
+        case "4": // change time
           tempBooking.modifyType = "time";
           return res.json(
-            respond("Select new time (e.g., 4PM):", "bookTime", {
-              phone,
-              tempBooking,
-            })
+            makeReply(
+              "Select new time between 10AM and 10PM (e.g., 4PM).",
+              "bookTime",
+              { phone, tempBooking }
+            )
           );
 
         case "5": // change all
           tempBooking.modifyType = "all";
           return res.json(
-            respond(
-              "Let's update everything.\n\nFirst, select services and press Done.",
+            makeReply(
+              "Let's update everything.\n\nFirst, pick services and press Done ✅.",
               "bookService",
               { phone, tempBooking }
             )
@@ -402,17 +423,19 @@ app.post("/chat", async (req, res) => {
             "DELETE FROM appointments WHERE appointment_id=$1",
             [tempBooking.appointmentId]
           );
-          return res.json(restart("❌ Appointment cancelled.", phone));
+          return res.json(
+            restartSession("❌ Appointment cancelled.", phone)
+          );
 
         case "7": // back
           return res.json(
-            respond("Returning to main menu.", "mainMenu", { phone })
+            makeReply("Returning to main menu.", "mainMenu", { phone })
           );
 
         default:
           return res.json(
-            respond(
-              "❌ Please choose 1–7.",
+            makeReply(
+              "❌ Please choose a valid option (1–7).",
               "modifyMenu",
               { phone, tempBooking }
             )
@@ -420,24 +443,23 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    /* STEP: BOOK SERVICE (USED BY NEW + MODIFY) */
+    /* STEP: bookService  (new + modify) */
     if (step === "bookService") {
-      // We only accept button-based flow
+      // For service selection we expect a special flag when user taps "Done"
       if (text !== "__done_services__") {
         return res.json(
-          respond(
-            "Please select services using the buttons, then press Done.",
+          makeReply(
+            "Please use the buttons to select services, then press Done ✅.",
             "bookService",
             { phone, tempBooking }
           )
         );
       }
 
-      // Done pressed
       if (!tempBooking.services || tempBooking.services.length === 0) {
         return res.json(
-          respond(
-            "❌ Please select at least one service.",
+          makeReply(
+            "❌ Please choose at least one valid service.",
             "bookService",
             { phone, tempBooking }
           )
@@ -447,13 +469,12 @@ app.post("/chat", async (req, res) => {
       const totalPrice = calculateTotalPrice(tempBooking.services);
       tempBooking.totalPrice = totalPrice;
 
-      // MODIFY: only services
+      // MODIFY → services only
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "services") {
-        // update only services + price
         await pool.query(
           `UPDATE appointments
-           SET services=$1, total_price=$2
-           WHERE appointment_id=$3`,
+           SET services = $1, total_price = $2
+           WHERE appointment_id = $3`,
           [
             tempBooking.services.join(", "),
             totalPrice,
@@ -462,18 +483,18 @@ app.post("/chat", async (req, res) => {
         );
 
         return res.json(
-          restart(
+          restartSession(
             `✅ Services updated.\nNew total: ₹${totalPrice}.`,
             phone
           )
         );
       }
 
-      // MODIFY: change all – next step: branch (but no DB yet)
+      // MODIFY → change all (next: branch)
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
         return res.json(
-          respond(
-            "Choose new branch:",
+          makeReply(
+            "Choose a branch:\n1) Miyapur\n2) Madhapur\n3) Jubilee Hills\n4) Banjara Hills",
             "bookBranch",
             { phone, tempBooking }
           )
@@ -483,30 +504,30 @@ app.post("/chat", async (req, res) => {
       // NEW booking
       tempBooking.mode = "new";
       return res.json(
-        respond(
-          "Choose a branch:",
+        makeReply(
+          "Choose a branch:\n1) Miyapur\n2) Madhapur\n3) Jubilee Hills\n4) Banjara Hills",
           "bookBranch",
           { phone, tempBooking }
         )
       );
     }
 
-    /* STEP: BOOK BRANCH (USED BY NEW + MODIFY) */
+    /* STEP: bookBranch */
     if (step === "bookBranch") {
       const n = Number(text);
       const branch = BRANCHES[n];
 
       if (!branch) {
         return res.json(
-          respond(
-            "❌ Please select a valid branch (1–4).",
+          makeReply(
+            "❌ Please choose a valid branch (1–4).",
             "bookBranch",
             { phone, tempBooking }
           )
         );
       }
 
-      // MODIFY: branch only
+      // MODIFY → branch only
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "branch") {
         await pool.query(
           `UPDATE appointments
@@ -516,33 +537,33 @@ app.post("/chat", async (req, res) => {
         );
 
         return res.json(
-          restart(
-            `✅ Branch changed to ${branch}.`,
+          restartSession(
+            `✅ Branch updated to ${branch}.`,
             phone
           )
         );
       }
 
-      // MODIFY: change all or NEW – just store and move on
+      // MODIFY → change all or NEW: store & next
       tempBooking.location = branch;
 
       return res.json(
-        respond(
-          "📆 Select date (DD-MM-YYYY):",
+        makeReply(
+          "📆 Select date (DD-MM-YYYY, within next 30 days).",
           "bookDate",
           { phone, tempBooking }
         )
       );
     }
 
-    /* STEP: BOOK DATE */
+    /* STEP: bookDate */
     if (step === "bookDate") {
-      const d = parseDate(text);
+      const d = parseDateDDMMYYYY(text);
 
       if (!d) {
         return res.json(
-          respond(
-            "❌ Invalid date. Please use DD-MM-YYYY within next 30 days.",
+          makeReply(
+            "❌ Please enter a valid date in DD-MM-YYYY within the next 30 days.",
             "bookDate",
             { phone, tempBooking }
           )
@@ -551,7 +572,7 @@ app.post("/chat", async (req, res) => {
 
       const iso = d.toISOString().split("T")[0];
 
-      // MODIFY: date only
+      // MODIFY → date only
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "date") {
         await pool.query(
           `UPDATE appointments
@@ -561,39 +582,42 @@ app.post("/chat", async (req, res) => {
         );
 
         return res.json(
-          restart(`✅ Date updated to ${iso}.`, phone)
+          restartSession(
+            `✅ Date updated to ${iso}.`,
+            phone
+          )
         );
       }
 
-      // MODIFY: change all or NEW – store and proceed
+      // MODIFY → change all or NEW
       tempBooking.dateISO = iso;
 
       return res.json(
-        respond(
-          "⏰ Select time (e.g., 4PM):",
+        makeReply(
+          "⏰ Select time between 10AM and 10PM (e.g., 4PM or 16).",
           "bookTime",
           { phone, tempBooking }
         )
       );
     }
 
-    /* STEP: BOOK TIME */
+    /* STEP: bookTime */
     if (step === "bookTime") {
-      const t = parseTime(text);
+      const parsed = parseTime(text);
 
-      if (!t) {
+      if (!parsed) {
         return res.json(
-          respond(
-            "❌ Invalid time. Please choose between 10AM and 10PM.",
+          makeReply(
+            "❌ Invalid time format. Try again (e.g., 4PM).",
             "bookTime",
             { phone, tempBooking }
           )
         );
       }
 
-      const timeLabel = t.label;
+      const timeLabel = parsed.label;
 
-      // MODIFY: time only
+      // MODIFY → time only
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "time") {
         await pool.query(
           `UPDATE appointments
@@ -603,11 +627,14 @@ app.post("/chat", async (req, res) => {
         );
 
         return res.json(
-          restart(`✅ Time updated to ${timeLabel}.`, phone)
+          restartSession(
+            `✅ Time updated to ${timeLabel}.`,
+            phone
+          )
         );
       }
 
-      // MODIFY: change all – final UPDATE with all new data
+      // MODIFY → change all (final UPDATE)
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
         const { services, totalPrice, location, dateISO } = tempBooking;
 
@@ -630,11 +657,14 @@ app.post("/chat", async (req, res) => {
         );
 
         return res.json(
-          restart("🔄 Appointment fully updated.", phone)
+          restartSession(
+            "🔄 Appointment fully updated.",
+            phone
+          )
         );
       }
 
-      // NEW booking – insert
+      // NEW booking → INSERT
       const { services, totalPrice, location, dateISO } = tempBooking;
 
       await pool.query(
@@ -645,27 +675,131 @@ app.post("/chat", async (req, res) => {
       );
 
       return res.json(
-        restart("🎉 Appointment confirmed!", phone)
+        restartSession(
+          "🎉 Appointment confirmed!",
+          phone
+        )
       );
     }
 
-    // Fallback
+    // fallback
     return res.json(
-      respond("Something went wrong. Starting again.\n\nEnter phone number:", "phone")
+      makeReply(
+        "Something went wrong... starting again.\nEnter phone number:",
+        "phone"
+      )
     );
+
   } catch (err) {
     console.error("chat error:", err);
     return res.status(500).json(
-      respond("Server error. Please try again.", "phone")
+      makeReply(
+        "Server error. Please try again.",
+        "phone"
+      )
     );
   }
 });
 
 /* ---------------------------------
+   WHATSAPP WEBHOOK (stub for now)
+   - GET /webhook : verification
+   - POST /webhook: basic echo reply
+   - Later we can hook into same flow
+-----------------------------------*/
+
+// Verification endpoint for Meta
+app.get("/webhook", (req, res) => {
+  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === verifyToken) {
+    console.log("✅ WhatsApp webhook verified");
+    res.status(200).send(challenge);
+  } else {
+    console.log("❌ WhatsApp webhook verification failed");
+    res.sendStatus(403);
+  }
+});
+
+// Main WhatsApp webhook receiver
+app.post("/webhook", async (req, res) => {
+  try {
+    const entry = req.body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const message = value?.messages?.[0];
+
+    if (!message) {
+      return res.sendStatus(200);
+    }
+
+    const from = message.from; // WhatsApp phone
+    const textBody = message.text?.body || "";
+
+    console.log("📲 WhatsApp message:", from, "→", textBody);
+
+    // For now, just send a simple reply.
+    // Later we can hook this into the same booking logic.
+    const reply =
+      "Hi from Mithil's Salon WhatsApp bot 💇‍♂️\n\n" +
+      "Right now this number is connected in test mode.\n" +
+      "Website chatbot is fully working — WhatsApp flow coming soon!";
+
+    await sendWhatsAppMessage(from, reply);
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("whatsapp webhook error:", err.response?.data || err.message);
+    res.sendStatus(500);
+  }
+});
+
+// Helper: send WhatsApp message using Cloud API
+async function sendWhatsAppMessage(to, message) {
+  const token = process.env.WHATSAPP_TOKEN;
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+
+  if (!token || !phoneNumberId) {
+    console.warn("⚠️ WhatsApp env vars missing, not sending message");
+    return;
+  }
+
+  const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
+
+  try {
+    await axios.post(
+      url,
+      {
+        messaging_product: "whatsapp",
+        to,
+        text: { body: message },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("✅ WhatsApp message sent to", to);
+  } catch (err) {
+    console.error(
+      "❌ Error sending WhatsApp message:",
+      err.response?.data || err.message
+    );
+  }
+}
+
+/* ---------------------------------
    START SERVER
 -----------------------------------*/
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
 await connectDB();
 app.listen(PORT, () => {
   console.log(`🚀 Server running → http://localhost:${PORT}`);
