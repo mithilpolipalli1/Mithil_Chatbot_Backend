@@ -1,0 +1,88 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Mithil's Salon API",
+    "version": "1.0.0",
+    "description": "API for managing salon users, admins, and appointments"
+  },
+
+  "servers": [
+    {
+      "url": "http://localhost:3000"
+    }
+  ],
+
+  "paths": {
+    "/check-user": {
+      "post": {
+        "summary": "Check if user exists",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "phone": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "User Found / Not Found" }
+        }
+      }
+    },
+
+    "/register": {
+      "post": {
+        "summary": "Register new user",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "phone": { "type": "string" },
+                  "name": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "User registered" }
+        }
+      }
+    },
+
+    "/book-appointment": {
+      "post": {
+        "summary": "Book appointment",
+        "responses": {
+          "200": { "description": "Appointment booked" }
+        }
+      }
+    },
+
+    "/get-appointments": {
+      "post": {
+        "summary": "Get all user appointments",
+        "responses": {
+          "200": { "description": "Appointment list" }
+        }
+      }
+    },
+
+    "/cancel-appointment": {
+      "post": {
+        "summary": "Cancel an appointment",
+        "responses": {
+          "200": { "description": "Appointment cancelled" }
+        }
+      }
+    }
+  }
+}

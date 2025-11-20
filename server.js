@@ -1,204 +1,672 @@
 // server.js
-const express = require('express');
-const cors = require('cors');
-const bcrypt = require('bcrypt'); // We still use this to hash the "default" password
-const db = require('./db');
+import express from "express";
+import cors from "cors";
+import { pool, connectDB } from "./db.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const saltRounds = 10;
+/* ---------------------------------
+   CONSTANTS & HELPERS
+-----------------------------------*/
 
-// --- Price List (in Rupees) ---
-const priceList = {
-    'haircut': 500.00,
-    'hair coloring': 800.00,
-    'facial': 400.00,
-    'manicure': 300.00,
-    'pedicure': 350.00,
-    'spa treatment': 1000.00,
-    'combo: haircut + facial': 800.00,
-    'combo: manicure + pedicure': 600.00
-};
-
-// --- Helper function to calculate total price ---
-// We add a new parameter 'isFirstBooking'
-function calculateTotalPrice(serviceNames, appointmentDate, isFirstBooking = false) {
-    let totalPrice = 0;
-    let weekendOfferApplied = false;
-    let firstBookingOfferApplied = false;
-    let services = [...serviceNames];
-
-    // 1. Check for Combos
-    if (services.includes('manicure') && services.includes('pedicure')) { totalPrice += priceList['combo: manicure + pedicure']; services.splice(services.indexOf('manicure'), 1); services.splice(services.indexOf('pedicure'), 1); }
-    if (services.includes('haircut') && services.includes('facial')) { totalPrice += priceList['combo: haircut + facial']; services.splice(services.indexOf('haircut'), 1); services.splice(services.indexOf('facial'), 1); }
-
-    // 2. Add remaining individual services
-    services.forEach(service => { if (priceList[service]) totalPrice += priceList[service]; });
-
-    // 3. Check for Weekend Offer (Sat/Sun)
-    const date = new Date(appointmentDate.replace(/-/g, '/'));
-    const dayOfWeek = date.getDay();
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-        weekendOfferApplied = true;
-        totalPrice = totalPrice * 0.90; // Apply 10% discount
-    }
-
-    // 4. Check for First Booking Offer (50% off)
-    // This is applied *after* the weekend discount
-    if (isFirstBooking) {
-        firstBookingOfferApplied = true;
-        totalPrice = totalPrice * 0.50; // Apply 50% discount
-    }
-
-    return {
-        finalPrice: parseFloat(totalPrice.toFixed(2)),
-        offerApplied: weekendOfferApplied,
-        firstBookingOfferApplied: firstBookingOfferApplied
-    };
+function getGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good Morning";
+  if (hour < 18) return "Good Afternoon";
+  return "Good Evening";
 }
 
+// Services: names as keys for easy lookup
+const SERVICE_PRICES = {
+  "Haircut": 300,
+  "Facial": 400,
+  "Shave": 150,
+  "Hair coloring": 500,
+  "Manicure": 350,
+};
 
-// === Customer Routes ===
+const BRANCHES = {
+  1: "Miyapur",
+  2: "Madhapur",
+  3: "Jubilee Hills",
+  4: "Banjara Hills",
+};
 
-// 1. CHECK IF A CUSTOMER EXISTS
-// (This is now the main "login" check)
-app.post('/check-user', async (req, res) => {
-    const { phone } = req.body;
-    try {
-        const result = await db.query('SELECT * FROM salon_users WHERE phone = $1', [phone]);
-        if (result.rows.length > 0) {
-            res.json({ exists: true, name: result.rows[0].name });
-        } else {
-            res.json({ exists: false });
-        }
-    } catch (err) {
-        console.error("Check User Error:", err);
-        res.status(500).json({ error: 'Database error' });
-    }
-});
+// Utility to build a response object
+function respond(reply, nextStep, extra = {}) {
+  return { reply, nextStep, ...extra };
+}
 
-// 2. REGISTER A NEW CUSTOMER
-// (Slightly updated to just hash a default password)
-app.post('/register', async (req, res) => {
-    const { phone, name, password } = req.body; // 'password' will be "whatsapp_user"
-    try {
-        // We still hash the default password for database consistency
-        const password_hash = await bcrypt.hash(password, saltRounds); 
-        
-        const result = await db.query(
-            'INSERT INTO salon_users (phone, name, password_hash) VALUES ($1, $2, $3) RETURNING *',
-            [phone, name, password_hash]
+// Restart flow back to main menu
+function restart(reply, phone) {
+  return {
+    reply:
+      `${reply}\n\n🔁 Session restarted.\n\n👇 Choose what to do next:`,
+    nextStep: "mainMenu",
+    phone,
+  };
+}
+
+// calculate total price for a list of service names
+function calculateTotalPrice(services = []) {
+  return services.reduce(
+    (sum, s) => sum + (SERVICE_PRICES[s] || 0),
+    0
+  );
+}
+
+// parse main menu choice string
+function parseMenu(text) {
+  const t = text.trim().toLowerCase();
+  if (["1", "book", "book appointment"].includes(t)) return "book";
+  if (["2", "view", "view appointments"].includes(t)) return "view";
+  if (
+    ["3", "modify", "reschedule", "reschedule / cancel", "reschedule/cancel"]
+      .includes(t)
+  )
+    return "modify";
+  return null;
+}
+
+// parse DD-MM-YYYY within next 30 days
+function parseDate(text) {
+  const parts = text.split(/[-/]/);
+  if (parts.length !== 3) return null;
+
+  const [dd, mm, yyyy] = parts.map(Number);
+  const d = new Date(yyyy, mm - 1, dd);
+
+  const valid =
+    d.getFullYear() === yyyy &&
+    d.getMonth() === mm - 1 &&
+    d.getDate() === dd;
+
+  if (!valid) return null;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const max = new Date();
+  max.setDate(max.getDate() + 30);
+
+  d.setHours(0, 0, 0, 0);
+
+  if (d < today || d > max) return null;
+
+  return d;
+}
+
+// parse "4PM" / "10AM" / "16" etc
+function parseTime(text) {
+  if (!text) return null;
+  let t = text.trim().toUpperCase().replace(/\s+/g, "");
+
+  // e.g. 4PM, 10AM, 12PM
+  let match = t.match(/^(\d{1,2})(AM|PM)$/);
+  if (match) {
+    let h = Number(match[1]);
+    const ampm = match[2];
+    let hour24 = h;
+
+    if (ampm === "PM" && h !== 12) hour24 += 12;
+    if (ampm === "AM" && h === 12) hour24 = 0;
+
+    if (hour24 < 10 || hour24 > 22) return null;
+
+    const label = `${((hour24 + 11) % 12) + 1}${ampm}`;
+    return { hour24, label };
+  }
+
+  // e.g. 16
+  match = t.match(/^(\d{1,2})$/);
+  if (match) {
+    const hour24 = Number(match[1]);
+    if (hour24 < 10 || hour24 > 22) return null;
+
+    const ampm = hour24 >= 12 ? "PM" : "AM";
+    const hr12 = ((hour24 + 11) % 12) + 1;
+    return { hour24, label: `${hr12}${ampm}` };
+  }
+
+  return null;
+}
+
+/* ---------------------------------
+   MAIN CHAT ROUTE
+-----------------------------------*/
+
+app.post("/chat", async (req, res) => {
+  try {
+    let { text, step, phone, tempBooking } = req.body;
+    text = (text || "").trim();
+    step = step || "phone";
+
+    // tempBooking holds session state for booking / modify
+    tempBooking = tempBooking || {};
+    tempBooking.services = tempBooking.services || [];
+
+    /* STEP: PHONE LOGIN */
+    if (step === "phone") {
+      const digits = text.replace(/\D/g, "");
+      if (digits.length !== 10) {
+        return res.json(
+          respond("Please enter a valid 10-digit phone number.", "phone")
         );
-        res.json({ success: true, user: { phone: result.rows[0].phone, name: result.rows[0].name } });
-    } catch (err) {
-        console.error("Register Error:", err);
-        res.status(500).json({ error: 'Registration failed' });
-    }
-});
+      }
 
-// 3. BOOK A NEW APPOINTMENT
-// (Updated to check for first booking)
-app.post('/book-appointment', async (req, res) => {
-    const { user_phone, services, location, date, time } = req.body;
+      phone = digits;
+      const result = await pool.query(
+        "SELECT * FROM salon_users WHERE phone=$1",
+        [phone]
+      );
 
-    let isFirstBooking = false;
-    try {
-        // Check if this user has any *other* bookings. 
-        // We check for bookings with status 'booked' or 'cancelled'
-        const bookingCheck = await db.query("SELECT 1 FROM appointments WHERE user_phone = $1 AND (status = 'booked' OR status = 'cancelled') LIMIT 1", [user_phone]);
-        if (bookingCheck.rows.length === 0) {
-            isFirstBooking = true; // This is their first appointment
-        }
-    } catch(err) {
-        console.error("Error checking first booking:", err);
-    }
+      if (result.rows.length > 0) {
+        const user = result.rows[0];
+        const greet = getGreeting();
 
-    // Calculate price, passing the isFirstBooking flag
-    const { finalPrice, offerApplied, firstBookingOfferApplied } = calculateTotalPrice(services, date, isFirstBooking);
-    
-    const servicesString = services.join(', ');
-
-    try {
-        const result = await db.query(
-            'INSERT INTO appointments (user_phone, services, location, appointment_date, appointment_time, total_price, status) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-            [user_phone, servicesString, location, date, time, finalPrice, 'booked']
+        return res.json(
+          respond(
+            `${greet} ${user.name.toLowerCase()}! 👋\n👇 Choose an option:`,
+            "mainMenu",
+            { phone }
+          )
         );
-        res.json({
-            success: true,
-            appointment: result.rows[0],
-            priceDetails: {
-                totalPrice: finalPrice,
-                offerApplied: offerApplied,
-                firstBookingOfferApplied: firstBookingOfferApplied // Send this back to the bot
-            }
+      }
+
+      // New user
+      return res.json(
+        respond("You're new here 🌟 What's your good name?", "newUserName", {
+          phone,
+        })
+      );
+    }
+
+    /* STEP: NEW USER NAME */
+    if (step === "newUserName") {
+      const name = text || "Guest";
+
+      await pool.query(
+        "INSERT INTO salon_users (phone, name) VALUES ($1,$2)",
+        [phone, name]
+      );
+
+      const greet = getGreeting();
+
+      return res.json(
+        respond(
+          `${greet} ${name.toLowerCase()}! 👋\n🎉 You get **50% OFF on your first service!**\n\n👇 Choose an option:`,
+          "mainMenu",
+          { phone }
+        )
+      );
+    }
+
+    /* STEP: MAIN MENU */
+    if (step === "mainMenu") {
+      const choice = parseMenu(text);
+
+      if (!choice) {
+        return res.json(
+          respond("👇 Please choose an option below.", "mainMenu", { phone })
+        );
+      }
+
+      // New booking
+      if (choice === "book") {
+        // new mode
+        tempBooking = {
+          mode: "new",
+          modifyType: null,
+          services: [],
+        };
+
+        return res.json(
+          respond(
+            "Which services do you want?\n\nTap to select, then press Done.",
+            "bookService",
+            { phone, tempBooking }
+          )
+        );
+      }
+
+      // View appointments
+      if (choice === "view") {
+        const result = await pool.query(
+          `SELECT services, location, appointment_date, appointment_time, total_price
+           FROM appointments
+           WHERE customer_phone=$1
+           ORDER BY appointment_date, appointment_time`,
+          [phone]
+        );
+
+        if (!result.rows.length) {
+          return res.json(
+            respond("📭 You have no appointments yet.", "mainMenu", { phone })
+          );
+        }
+
+        const lines = result.rows.map((r, i) => {
+          const d = r.appointment_date.toISOString().split("T")[0];
+          const price = r.total_price ? ` - ₹${r.total_price}` : "";
+          return `${i + 1}) ${r.services} at ${r.location} on ${d} ${
+            r.appointment_time
+          }${price}`;
         });
-    } catch (err) {
-        console.error("Booking Error:", err);
-        res.status(500).json({ error: 'Booking failed' });
-    }
-});
 
-
-// 4. GET A CUSTOMER'S UPCOMING APPOINTMENTS
-app.post('/get-appointments', async (req, res) => {
-    const { user_phone } = req.body;
-    try {
-        const result = await db.query(
-            "SELECT * FROM appointments WHERE user_phone = $1 AND status = 'booked' ORDER BY appointment_date, appointment_time",
-            [user_phone]
+        return res.json(
+          respond(
+            `📋 Your appointments:\n\n${lines.join("\n")}`,
+            "mainMenu",
+            { phone }
+          )
         );
-        res.json({ success: true, appointments: result.rows });
-    } catch (err) {
-        console.error("Get Appointments Error:", err);
-        res.status(500).json({ error: 'Database error' });
-    }
-});
+      }
 
-// 5. CANCEL AN APPOINTMENT
-app.post('/cancel-appointment', async (req, res) => {
-    const { appointment_id } = req.body;
-    try {
-        const result = await db.query(
-            "UPDATE appointments SET status = 'cancelled' WHERE appointment_id = $1 RETURNING *",
-            [appointment_id]
+      // Reschedule / Cancel / Modify
+      if (choice === "modify") {
+        const result = await pool.query(
+          `SELECT appointment_id, services, location, appointment_date, appointment_time, total_price
+           FROM appointments
+           WHERE customer_phone=$1
+           ORDER BY appointment_date, appointment_time`,
+          [phone]
         );
-        res.json({ success: true, cancelled_appointment: result.rows[0] });
-    } catch (err) {
-        console.error("Cancel Appointment Error:", err);
-        res.status(500).json({ error: 'Database error' });
-    }
-});
 
+        if (!result.rows.length) {
+          return res.json(
+            respond("📭 You have no appointments to modify.", "mainMenu", {
+              phone,
+            })
+          );
+        }
 
-// === Admin Route ===
+        const lines = result.rows.map((r, i) => {
+          const d = r.appointment_date.toISOString().split("T")[0];
+          const price = r.total_price ? ` - ₹${r.total_price}` : "";
+          return `${i + 1}) ${r.services} at ${r.location} on ${d} ${
+            r.appointment_time
+          }${price}`;
+        });
 
-// 6. GET ALL APPOINTMENTS (FOR ADMIN)
-// (This route is still needed for the admin view)
-app.get('/get-all-appointments', async (req, res) => {
-    try {
-        const result = await db.query(
-            `SELECT a.appointment_id, a.user_phone, u.name AS customer_name, a.services, a.location,
-                    a.appointment_date, a.appointment_time, a.total_price, a.status
-             FROM appointments a JOIN salon_users u ON a.user_phone = u.phone
-             ORDER BY a.appointment_date DESC, a.appointment_time DESC`
+        return res.json(
+          respond(
+            `🛠 Select an appointment to modify:\n\n${lines.join("\n")}`,
+            "modifyPick",
+            { phone }
+          )
         );
-        res.json({ success: true, appointments: result.rows });
-    } catch (err) {
-        console.error("Get All Appointments Error:", err);
-        res.status(500).json({ error: 'Database error fetching all appointments' });
+      }
     }
+
+    /* STEP: PICK APPOINTMENT TO MODIFY */
+    if (step === "modifyPick") {
+      const result = await pool.query(
+        `SELECT appointment_id, services, location, appointment_date, appointment_time, total_price
+         FROM appointments
+         WHERE customer_phone=$1
+         ORDER BY appointment_date, appointment_time`,
+        [phone]
+      );
+
+      const idx = Number(text) - 1;
+      if (Number.isNaN(idx) || idx < 0 || idx >= result.rows.length) {
+        return res.json(
+          respond("❌ Invalid number. Try again.", "modifyPick", { phone })
+        );
+      }
+
+      const appt = result.rows[idx];
+
+      tempBooking = {
+        mode: "modify",
+        modifyType: null,
+        appointmentId: appt.appointment_id,
+        services: appt.services ? appt.services.split(", ").filter(Boolean) : [],
+        location: appt.location,
+        dateISO: appt.appointment_date.toISOString().split("T")[0],
+        timeLabel: appt.appointment_time,
+        totalPrice: appt.total_price,
+      };
+
+      const msg = `What would you like to modify?\n
+1) Change services
+2) Change branch
+3) Change date
+4) Change time
+5) Change all
+6) Cancel appointment
+7) Back`;
+
+      return res.json(
+        respond(msg, "modifyMenu", { phone, tempBooking })
+      );
+    }
+
+    /* STEP: MODIFY MENU */
+    if (step === "modifyMenu") {
+      const choice = text.trim();
+
+      switch (choice) {
+        case "1": // services
+          tempBooking.modifyType = "services";
+          // existing services will show as pre-selected in UI
+          return res.json(
+            respond(
+              "Select new services (tap to toggle) and press Done.",
+              "bookService",
+              { phone, tempBooking }
+            )
+          );
+
+        case "2": // branch
+          tempBooking.modifyType = "branch";
+          return res.json(
+            respond("Choose new branch:", "bookBranch", {
+              phone,
+              tempBooking,
+            })
+          );
+
+        case "3": // date
+          tempBooking.modifyType = "date";
+          return res.json(
+            respond("Select new date (DD-MM-YYYY):", "bookDate", {
+              phone,
+              tempBooking,
+            })
+          );
+
+        case "4": // time
+          tempBooking.modifyType = "time";
+          return res.json(
+            respond("Select new time (e.g., 4PM):", "bookTime", {
+              phone,
+              tempBooking,
+            })
+          );
+
+        case "5": // change all
+          tempBooking.modifyType = "all";
+          return res.json(
+            respond(
+              "Let's update everything.\n\nFirst, select services and press Done.",
+              "bookService",
+              { phone, tempBooking }
+            )
+          );
+
+        case "6": // cancel appointment
+          await pool.query(
+            "DELETE FROM appointments WHERE appointment_id=$1",
+            [tempBooking.appointmentId]
+          );
+          return res.json(restart("❌ Appointment cancelled.", phone));
+
+        case "7": // back
+          return res.json(
+            respond("Returning to main menu.", "mainMenu", { phone })
+          );
+
+        default:
+          return res.json(
+            respond(
+              "❌ Please choose 1–7.",
+              "modifyMenu",
+              { phone, tempBooking }
+            )
+          );
+      }
+    }
+
+    /* STEP: BOOK SERVICE (USED BY NEW + MODIFY) */
+    if (step === "bookService") {
+      // We only accept button-based flow
+      if (text !== "__done_services__") {
+        return res.json(
+          respond(
+            "Please select services using the buttons, then press Done.",
+            "bookService",
+            { phone, tempBooking }
+          )
+        );
+      }
+
+      // Done pressed
+      if (!tempBooking.services || tempBooking.services.length === 0) {
+        return res.json(
+          respond(
+            "❌ Please select at least one service.",
+            "bookService",
+            { phone, tempBooking }
+          )
+        );
+      }
+
+      const totalPrice = calculateTotalPrice(tempBooking.services);
+      tempBooking.totalPrice = totalPrice;
+
+      // MODIFY: only services
+      if (tempBooking.mode === "modify" && tempBooking.modifyType === "services") {
+        // update only services + price
+        await pool.query(
+          `UPDATE appointments
+           SET services=$1, total_price=$2
+           WHERE appointment_id=$3`,
+          [
+            tempBooking.services.join(", "),
+            totalPrice,
+            tempBooking.appointmentId,
+          ]
+        );
+
+        return res.json(
+          restart(
+            `✅ Services updated.\nNew total: ₹${totalPrice}.`,
+            phone
+          )
+        );
+      }
+
+      // MODIFY: change all – next step: branch (but no DB yet)
+      if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
+        return res.json(
+          respond(
+            "Choose new branch:",
+            "bookBranch",
+            { phone, tempBooking }
+          )
+        );
+      }
+
+      // NEW booking
+      tempBooking.mode = "new";
+      return res.json(
+        respond(
+          "Choose a branch:",
+          "bookBranch",
+          { phone, tempBooking }
+        )
+      );
+    }
+
+    /* STEP: BOOK BRANCH (USED BY NEW + MODIFY) */
+    if (step === "bookBranch") {
+      const n = Number(text);
+      const branch = BRANCHES[n];
+
+      if (!branch) {
+        return res.json(
+          respond(
+            "❌ Please select a valid branch (1–4).",
+            "bookBranch",
+            { phone, tempBooking }
+          )
+        );
+      }
+
+      // MODIFY: branch only
+      if (tempBooking.mode === "modify" && tempBooking.modifyType === "branch") {
+        await pool.query(
+          `UPDATE appointments
+           SET location=$1
+           WHERE appointment_id=$2`,
+          [branch, tempBooking.appointmentId]
+        );
+
+        return res.json(
+          restart(
+            `✅ Branch changed to ${branch}.`,
+            phone
+          )
+        );
+      }
+
+      // MODIFY: change all or NEW – just store and move on
+      tempBooking.location = branch;
+
+      return res.json(
+        respond(
+          "📆 Select date (DD-MM-YYYY):",
+          "bookDate",
+          { phone, tempBooking }
+        )
+      );
+    }
+
+    /* STEP: BOOK DATE */
+    if (step === "bookDate") {
+      const d = parseDate(text);
+
+      if (!d) {
+        return res.json(
+          respond(
+            "❌ Invalid date. Please use DD-MM-YYYY within next 30 days.",
+            "bookDate",
+            { phone, tempBooking }
+          )
+        );
+      }
+
+      const iso = d.toISOString().split("T")[0];
+
+      // MODIFY: date only
+      if (tempBooking.mode === "modify" && tempBooking.modifyType === "date") {
+        await pool.query(
+          `UPDATE appointments
+           SET appointment_date=$1
+           WHERE appointment_id=$2`,
+          [iso, tempBooking.appointmentId]
+        );
+
+        return res.json(
+          restart(`✅ Date updated to ${iso}.`, phone)
+        );
+      }
+
+      // MODIFY: change all or NEW – store and proceed
+      tempBooking.dateISO = iso;
+
+      return res.json(
+        respond(
+          "⏰ Select time (e.g., 4PM):",
+          "bookTime",
+          { phone, tempBooking }
+        )
+      );
+    }
+
+    /* STEP: BOOK TIME */
+    if (step === "bookTime") {
+      const t = parseTime(text);
+
+      if (!t) {
+        return res.json(
+          respond(
+            "❌ Invalid time. Please choose between 10AM and 10PM.",
+            "bookTime",
+            { phone, tempBooking }
+          )
+        );
+      }
+
+      const timeLabel = t.label;
+
+      // MODIFY: time only
+      if (tempBooking.mode === "modify" && tempBooking.modifyType === "time") {
+        await pool.query(
+          `UPDATE appointments
+           SET appointment_time=$1
+           WHERE appointment_id=$2`,
+          [timeLabel, tempBooking.appointmentId]
+        );
+
+        return res.json(
+          restart(`✅ Time updated to ${timeLabel}.`, phone)
+        );
+      }
+
+      // MODIFY: change all – final UPDATE with all new data
+      if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
+        const { services, totalPrice, location, dateISO } = tempBooking;
+
+        await pool.query(
+          `UPDATE appointments
+           SET services=$1,
+               location=$2,
+               appointment_date=$3,
+               appointment_time=$4,
+               total_price=$5
+           WHERE appointment_id=$6`,
+          [
+            services.join(", "),
+            location,
+            dateISO,
+            timeLabel,
+            totalPrice,
+            tempBooking.appointmentId,
+          ]
+        );
+
+        return res.json(
+          restart("🔄 Appointment fully updated.", phone)
+        );
+      }
+
+      // NEW booking – insert
+      const { services, totalPrice, location, dateISO } = tempBooking;
+
+      await pool.query(
+        `INSERT INTO appointments
+         (customer_phone, services, location, appointment_date, appointment_time, total_price, status)
+         VALUES ($1,$2,$3,$4,$5,$6,'booked')`,
+        [phone, services.join(", "), location, dateISO, timeLabel, totalPrice]
+      );
+
+      return res.json(
+        restart("🎉 Appointment confirmed!", phone)
+      );
+    }
+
+    // Fallback
+    return res.json(
+      respond("Something went wrong. Starting again.\n\nEnter phone number:", "phone")
+    );
+  } catch (err) {
+    console.error("chat error:", err);
+    return res.status(500).json(
+      respond("Server error. Please try again.", "phone")
+    );
+  }
 });
 
+/* ---------------------------------
+   START SERVER
+-----------------------------------*/
 
-// === REMOVED ROUTES ===
-// app.post('/login', ...) is no longer needed
-// app.post('/admin-login', ...) is no longer needed
-
-
-// Start the server
 const PORT = 3000;
+await connectDB();
 app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+  console.log(`🚀 Server running → http://localhost:${PORT}`);
 });
