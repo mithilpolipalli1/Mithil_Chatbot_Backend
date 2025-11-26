@@ -1,656 +1,578 @@
-// server.js
 import express from "express";
 import cors from "cors";
-import axios from "axios";
-import dotenv from "dotenv";
 import { pool, connectDB } from "./db.js";
 
-dotenv.config();
-
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
-/* ---------------------------------
-   HELPERS & CONSTANTS
------------------------------------*/
-
-function getGreeting() {
-  const hour = new Date().getHours();
-  if (hour < 12) return "Good Morning";
-  if (hour < 18) return "Good Afternoon";
-  return "Good Evening";
-}
-
-// All services with prices (names used everywhere)
+// -----------------------------------------
+// CONSTANTS
+// -----------------------------------------
 const SERVICE_PRICES = {
   "Haircut": 300,
   "Facial": 400,
   "Shave": 150,
   "Hair coloring": 500,
-  "Manicure": 350,
+  "Manicure": 350
 };
 
 const BRANCHES = {
   1: "Miyapur",
   2: "Madhapur",
   3: "Jubilee Hills",
-  4: "Banjara Hills",
+  4: "Banjara Hills"
 };
 
-// Main-menu choice parser
-function parseMenuChoice(text) {
-  const t = (text || "").toString().trim().toLowerCase();
-  if (["1", "book", "book appointment"].includes(t)) return "book";
-  if (["2", "view", "view appointments"].includes(t)) return "view";
-  if (
-    [
-      "3",
-      "modify",
-      "modify appointment",
-      "reschedule",
-      "reschedule / cancel",
-      "reschedule/cancel",
-    ].includes(t)
-  )
-    return "modify";
-
-  return null;
+function greetUser() {
+  const hr = new Date().getHours();
+  if (hr < 12) return "Good Morning";
+  if (hr < 18) return "Good Afternoon";
+  return "Good Evening";
 }
 
-// Basic response helper
-function makeReply(reply, nextStep, extra = {}) {
+function respond(reply, nextStep, extra = {}) {
   return { reply, nextStep, ...extra };
 }
 
-// Restart chat loop
-function restartSession(reply, phone) {
-  return {
-    reply:
-      `${reply}\n\n🔁 Session restarted.\n\n👇 Choose what to do next:`,
-    nextStep: "mainMenu",
-    phone,
-  };
+function calculateTotal(services) {
+  return services.reduce((sum, s) => sum + (SERVICE_PRICES[s] || 0), 0);
 }
 
-// Parse DD-MM-YYYY within next 30 days
-function parseDateDDMMYYYY(text) {
-  const parts = text.trim().split(/[-/]/);
-  if (parts.length !== 3) return null;
+// -----------------------------------------
+// DATE / TIME HELPERS
+// -----------------------------------------
+function parseDate(input) {
+  const t = input.trim();
+  let parts;
 
-  const [dd, mm, yyyy] = parts.map(Number);
-  const d = new Date(yyyy, mm - 1, dd);
-
-  const valid =
-    d.getFullYear() === yyyy &&
-    d.getMonth() === mm - 1 &&
-    d.getDate() === dd;
-
-  if (!valid) return null;
-
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const max = new Date();
-  max.setDate(max.getDate() + 30);
-  d.setHours(0, 0, 0, 0);
-
-  if (d < today || d > max) return null;
-
-  return d;
-}
-
-// Parse time (10–22 allowed) like "4PM" or "16"
-function parseTime(text) {
-  if (!text) return null;
-  let t = text.toString().trim().toUpperCase().replace(/\s+/g, "");
-
-  // 4PM, 10AM, 12PM
-  let match = t.match(/^(\d{1,2})(AM|PM)$/);
-  if (match) {
-    let h = Number(match[1]);
-    const ampm = match[2];
-
-    if (h < 1 || h > 12) return null;
-
-    let hour24 = h;
-    if (ampm === "PM" && h !== 12) hour24 += 12;
-    if (ampm === "AM" && h === 12) hour24 = 0;
-
-    if (hour24 < 10 || hour24 > 22) return null;
-
-    const label = `${((hour24 + 11) % 12) + 1}${ampm}`;
-    return { hour24, label };
+  // DD-MM-YYYY
+  if (/^\d{2}-\d{2}-\d{4}$/.test(t)) {
+    parts = t.split("-").map(Number);
+    return new Date(parts[2], parts[1] - 1, parts[0]);
   }
 
-  // 16 (24h)
-  match = t.match(/^(\d{1,2})$/);
-  if (match) {
-    const hour24 = Number(match[1]);
-    if (hour24 < 10 || hour24 > 22) return null;
-
-    const ampm = hour24 >= 12 ? "PM" : "AM";
-    const hr12 = ((hour24 + 11) % 12) + 1;
-    return { hour24, label: `${hr12}${ampm}` };
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) {
+    parts = t.split("-").map(Number);
+    return new Date(parts[0], parts[1] - 1, parts[2]);
   }
 
   return null;
 }
 
-// Calculate total price from array of service names
-function calculateTotalPrice(services = []) {
-  return services.reduce(
-    (sum, name) => sum + (SERVICE_PRICES[name] || 0),
-    0
-  );
+function formatTime(hour24) {
+  let h = hour24;
+  const ampm = h >= 12 ? "PM" : "AM";
+  h = h % 12;
+  if (h === 0) h = 12;
+  return `${h}${ampm}`;
 }
 
-/* ---------------------------------
-   WEBSITE CHAT ENDPOINT (/chat)
-   - This is what your frontend uses
------------------------------------*/
+function generateTimeButtons() {
+  return Array.from({ length: 13 }, (_, i) => {
+    const hr = i + 10;
+    return { text: formatTime(hr), value: formatTime(hr) };
+  });
+}
 
+// -----------------------------------------
+// MAIN ROUTE
+// -----------------------------------------
 app.post("/chat", async (req, res) => {
   try {
     let { text, step, phone, tempBooking } = req.body;
 
-    text = (text || "").toString().trim();
+    text = (text || "").trim();
     step = step || "phone";
 
-    // tempBooking stores current booking/modify state
     tempBooking = tempBooking || {};
     tempBooking.services = tempBooking.services || [];
 
-    /* STEP: phone (login / register) */
+    // -----------------------------------------
+    // PHONE LOGIN
+    // -----------------------------------------
     if (step === "phone") {
       const digits = text.replace(/\D/g, "");
-      if (digits.length !== 10) {
-        return res.json(
-          makeReply("Please enter a valid 10-digit phone number.", "phone")
-        );
-      }
+      if (digits.length !== 10)
+        return res.json(respond("📱 Enter your 10-digit phone number:", "phone"));
 
       phone = digits;
 
       const result = await pool.query(
-        "SELECT * FROM salon_users WHERE phone = $1",
+        "SELECT * FROM salon_users WHERE phone=$1",
         [phone]
       );
 
-      if (result.rows.length > 0) {
-        const user = result.rows[0];
-        const greet = getGreeting();
+      const greet = greetUser();
 
+      if (result.rows.length > 0) {
         return res.json(
-          makeReply(
-            `${greet} ${user.name.toLowerCase()}! 👋\n👇 Choose an option below:`,
+          respond(
+            `${greet} ${result.rows[0].name}! 👋`,
             "mainMenu",
-            { phone }
-          )
-        );
-      } else {
-        return res.json(
-          makeReply(
-            "You're new here 🌟 What's your good name?",
-            "newUserName",
-            { phone }
+            {
+              phone,
+              buttons: [
+                { text: "📅 Book Appointment", value: "book" },
+                { text: "👀 View Appointments", value: "view" },
+                { text: "🛠 Reschedule / Cancel", value: "modify" }
+              ]
+            }
           )
         );
       }
+
+      return res.json(
+        respond("You're new! What's your name?", "newUserName", { phone })
+      );
     }
 
-    /* STEP: new user name */
+    // -----------------------------------------
+    // NEW USER NAME
+    // -----------------------------------------
     if (step === "newUserName") {
-      const name = text || "Guest";
+      const name = text;
 
       await pool.query(
-        "INSERT INTO salon_users (phone, name) VALUES ($1,$2) ON CONFLICT (phone) DO UPDATE SET name=EXCLUDED.name",
+        "INSERT INTO salon_users (phone, name) VALUES ($1,$2)",
         [phone, name]
       );
 
-      const greet = getGreeting();
-
       return res.json(
-        makeReply(
-          `${greet} ${name.toLowerCase()}! 👋\n🎉 You get **50% OFF on your first service!**\n\n👇 Choose an option below:`,
+        respond(
+          `🎉 Welcome ${name}! You get 50% OFF on your first service.`,
           "mainMenu",
-          { phone }
+          {
+            phone,
+            buttons: [
+              { text: "📅 Book Appointment", value: "book" },
+              { text: "👀 View Appointments", value: "view" },
+              { text: "🛠 Reschedule / Cancel", value: "modify" }
+            ]
+          }
         )
       );
     }
 
-    /* STEP: main menu */
+    // -----------------------------------------
+    // MAIN MENU
+    // -----------------------------------------
     if (step === "mainMenu") {
-      const choice = parseMenuChoice(text);
-
-      if (!choice) {
+      if (text === "book") {
+        tempBooking = { mode: "new", services: [] };
         return res.json(
-          makeReply("👇 Please choose an option below.", "mainMenu", { phone })
-        );
-      }
-
-      // BOOK new appointment
-      if (choice === "book") {
-        tempBooking = {
-          mode: "new",       // new | modify
-          modifyType: null,  // services | branch | date | time | all
-          services: [],
-        };
-
-        return res.json(
-          makeReply(
-            "Which services do you want?\n\nTap to select, then press Done ✅.",
+          respond(
+            "Select services:",
             "bookService",
-            { phone, tempBooking }
+            {
+              phone,
+              tempBooking,
+              buttons: [
+                { text: "Haircut", value: "Haircut" },
+                { text: "Facial", value: "Facial" },
+                { text: "Shave", value: "Shave" },
+                { text: "Hair coloring", value: "Hair coloring" },
+                { text: "Manicure", value: "Manicure" },
+                { text: "Done", value: "__done_services__" }
+              ]
+            }
           )
         );
       }
 
-      // VIEW appointments
-      if (choice === "view") {
+      if (text === "view") {
         const result = await pool.query(
-          `SELECT services, location, appointment_date, appointment_time, total_price, status
-           FROM appointments
-           WHERE customer_phone = $1
+          `SELECT * FROM appointments 
+           WHERE customer_phone=$1
            ORDER BY appointment_date, appointment_time`,
           [phone]
         );
 
-        if (!result.rows.length) {
-          return res.json(
-            makeReply(
-              "📭 You have no appointments yet.",
-              "mainMenu",
-              { phone }
-            )
-          );
-        }
+        if (!result.rows.length)
+          return res.json(respond("📭 You have no appointments.", "mainMenu", { phone }));
 
-        const lines = result.rows.map((row, idx) => {
-          const d = row.appointment_date.toISOString().split("T")[0];
-          const price = row.total_price ? ` - ₹${row.total_price}` : "";
-          return `${idx + 1}) ${row.services} at ${row.location} on ${d} ${
-            row.appointment_time
-          } (${row.status}${price})`;
-        });
+        const formatted = result.rows.map((a, i) =>
+          `${i + 1}) ${a.services} at ${a.location} on ${a.appointment_date
+            .toISOString()
+            .split("T")[0]} ${a.appointment_time} — ₹${a.total_price}`
+        );
 
         return res.json(
-          makeReply(
-            `📋 Your appointments:\n\n${lines.join("\n")}`,
+          respond(
+            `📋 Your Appointments:\n\n${formatted.join("\n")}`,
             "mainMenu",
-            { phone }
+            {
+              phone,
+              buttons: [
+                { text: "📅 Book Another", value: "book" },
+                { text: "🛠 Reschedule / Cancel", value: "modify" }
+              ]
+            }
           )
         );
       }
 
-      // MODIFY / RESCHEDULE / CANCEL
-      if (choice === "modify") {
+      if (text === "modify") {
         const result = await pool.query(
-          `SELECT appointment_id, services, location, appointment_date, appointment_time, total_price
-           FROM appointments
-           WHERE customer_phone = $1
+          `SELECT * FROM appointments 
+           WHERE customer_phone=$1
            ORDER BY appointment_date, appointment_time`,
           [phone]
         );
 
-        if (!result.rows.length) {
-          return res.json(
-            makeReply(
-              "📭 You have no appointments to modify.",
-              "mainMenu",
-              { phone }
-            )
-          );
-        }
-
-        const lines = result.rows.map((row, idx) => {
-          const d = row.appointment_date.toISOString().split("T")[0];
-          const price = row.total_price ? ` - ₹${row.total_price}` : "";
-          return `${idx + 1}) ${row.services} at ${row.location} on ${d} ${
-            row.appointment_time
-          }${price}`;
-        });
+        if (!result.rows.length)
+          return res.json(respond("📭 No appointments to modify.", "mainMenu", { phone }));
 
         return res.json(
-          makeReply(
-            `🛠 Select an appointment to modify:\n\n${lines.join("\n")}`,
+          respond(
+            "Select appointment to modify:",
             "modifyPick",
-            { phone }
+            {
+              phone,
+              appointments: result.rows,
+              buttons: result.rows.map((a, i) => ({
+                text: `${i + 1}) ${a.services} (${a.location})`,
+                value: String(i + 1)
+              }))
+            }
           )
         );
       }
+
+      return res.json(respond("Choose a valid option.", "mainMenu"));
     }
 
-    /* STEP: pick appointment to modify */
+    // -----------------------------------------
+    // MODIFY PICK
+    // -----------------------------------------
     if (step === "modifyPick") {
-      const idx = Number(text) - 1;
-
       const result = await pool.query(
-        `SELECT appointment_id, services, location, appointment_date, appointment_time, total_price
-         FROM appointments
-         WHERE customer_phone = $1
-         ORDER BY appointment_date, appointment_time`,
+        `SELECT * FROM appointments 
+         WHERE customer_phone=$1`,
         [phone]
       );
 
-      if (Number.isNaN(idx) || idx < 0 || idx >= result.rows.length) {
-        return res.json(
-          makeReply("❌ Invalid number. Try again.", "modifyPick", { phone })
-        );
-      }
+      const idx = Number(text) - 1;
+      if (idx < 0 || idx >= result.rows.length)
+        return res.json(respond("❌ Invalid choice.", "modifyPick", { phone }));
 
-      const appt = result.rows[idx];
+      const a = result.rows[idx];
 
       tempBooking = {
         mode: "modify",
-        modifyType: null,
-        appointmentId: appt.appointment_id,
-        services: appt.services
-          ? appt.services.split(",").map(s => s.trim()).filter(Boolean)
-          : [],
-        location: appt.location,
-        dateISO: appt.appointment_date.toISOString().split("T")[0],
-        timeLabel: appt.appointment_time,
-        totalPrice: appt.total_price,
+        appointmentId: a.appointment_id,
+        services: a.services.split(", "),
+        location: a.location,
+        dateISO: a.appointment_date.toISOString().split("T")[0],
+        timeLabel: a.appointment_time,
+        totalPrice: a.total_price
       };
 
-      const msg = `What would you like to modify?\n
-1) Change services
-2) Change branch
-3) Change date
-4) Change time
-5) Change all
-6) Cancel appointment
-7) Back`;
-
       return res.json(
-        makeReply(msg, "modifyMenu", { phone, tempBooking })
-      );
-    }
-
-    /* STEP: modify menu */
-    if (step === "modifyMenu") {
-      const choice = text.trim();
-
-      switch (choice) {
-        case "1": // change services only
-          tempBooking.modifyType = "services";
-          return res.json(
-            makeReply(
-              "Select new services (tap to toggle) and press Done ✅.",
-              "bookService",
-              { phone, tempBooking }
-            )
-          );
-
-        case "2": // change branch
-          tempBooking.modifyType = "branch";
-          return res.json(
-            makeReply(
-              "Choose a new branch:\n1) Miyapur\n2) Madhapur\n3) Jubilee Hills\n4) Banjara Hills",
-              "bookBranch",
-              { phone, tempBooking }
-            )
-          );
-
-        case "3": // change date
-          tempBooking.modifyType = "date";
-          return res.json(
-            makeReply(
-              "Select new date (DD-MM-YYYY, within next 30 days).",
-              "bookDate",
-              { phone, tempBooking }
-            )
-          );
-
-        case "4": // change time
-          tempBooking.modifyType = "time";
-          return res.json(
-            makeReply(
-              "Select new time between 10AM and 10PM (e.g., 4PM).",
-              "bookTime",
-              { phone, tempBooking }
-            )
-          );
-
-        case "5": // change all
-          tempBooking.modifyType = "all";
-          return res.json(
-            makeReply(
-              "Let's update everything.\n\nFirst, pick services and press Done ✅.",
-              "bookService",
-              { phone, tempBooking }
-            )
-          );
-
-        case "6": // cancel appointment
-          await pool.query(
-            "DELETE FROM appointments WHERE appointment_id=$1",
-            [tempBooking.appointmentId]
-          );
-          return res.json(
-            restartSession("❌ Appointment cancelled.", phone)
-          );
-
-        case "7": // back
-          return res.json(
-            makeReply("Returning to main menu.", "mainMenu", { phone })
-          );
-
-        default:
-          return res.json(
-            makeReply(
-              "❌ Please choose a valid option (1–7).",
-              "modifyMenu",
-              { phone, tempBooking }
-            )
-          );
-      }
-    }
-
-    /* STEP: bookService  (new + modify) */
-    if (step === "bookService") {
-      // For service selection we expect a special flag when user taps "Done"
-      if (text !== "__done_services__") {
-        return res.json(
-          makeReply(
-            "Please use the buttons to select services, then press Done ✅.",
-            "bookService",
-            { phone, tempBooking }
-          )
-        );
-      }
-
-      if (!tempBooking.services || tempBooking.services.length === 0) {
-        return res.json(
-          makeReply(
-            "❌ Please choose at least one valid service.",
-            "bookService",
-            { phone, tempBooking }
-          )
-        );
-      }
-
-      const totalPrice = calculateTotalPrice(tempBooking.services);
-      tempBooking.totalPrice = totalPrice;
-
-      // MODIFY → services only
-      if (tempBooking.mode === "modify" && tempBooking.modifyType === "services") {
-        await pool.query(
-          `UPDATE appointments
-           SET services = $1, total_price = $2
-           WHERE appointment_id = $3`,
-          [
-            tempBooking.services.join(", "),
-            totalPrice,
-            tempBooking.appointmentId,
-          ]
-        );
-
-        return res.json(
-          restartSession(
-            `✅ Services updated.\nNew total: ₹${totalPrice}.`,
-            phone
-          )
-        );
-      }
-
-      // MODIFY → change all (next: branch)
-      if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
-        return res.json(
-          makeReply(
-            "Choose a branch:\n1) Miyapur\n2) Madhapur\n3) Jubilee Hills\n4) Banjara Hills",
-            "bookBranch",
-            { phone, tempBooking }
-          )
-        );
-      }
-
-      // NEW booking
-      tempBooking.mode = "new";
-      return res.json(
-        makeReply(
-          "Choose a branch:\n1) Miyapur\n2) Madhapur\n3) Jubilee Hills\n4) Banjara Hills",
-          "bookBranch",
-          { phone, tempBooking }
+        respond(
+          "What would you like to modify?",
+          "modifyMenu",
+          {
+            phone,
+            tempBooking,
+            buttons: [
+              { text: "✂ Change Services", value: "1" },
+              { text: "📍 Change Branch", value: "2" },
+              { text: "📆 Change Date", value: "3" },
+              { text: "⏰ Change Time", value: "4" },
+              { text: "🔄 Change All", value: "5" },
+              { text: "❌ Cancel Appointment", value: "6" },
+              { text: "⬅ Back", value: "7" }
+            ]
+          }
         )
       );
     }
 
-    /* STEP: bookBranch */
-    if (step === "bookBranch") {
-      const n = Number(text);
-      const branch = BRANCHES[n];
+    // -----------------------------------------
+    // MODIFY MENU
+    // -----------------------------------------
+    if (step === "modifyMenu") {
+      // Set modify type
+      switch (text) {
+        case "1":
+          tempBooking.modifyType = "services";
+          return res.json(
+            respond("Select new services:", "bookService", {
+              phone,
+              tempBooking,
+              buttons: [
+                { text: "Haircut", value: "Haircut" },
+                { text: "Facial", value: "Facial" },
+                { text: "Shave", value: "Shave" },
+                { text: "Hair coloring", value: "Hair coloring" },
+                { text: "Manicure", value: "Manicure" },
+                { text: "Done", value: "__done_services__" }
+              ]
+            })
+          );
 
-      if (!branch) {
+        case "2":
+          tempBooking.modifyType = "branch";
+          return res.json(
+            respond("Choose new branch:", "bookBranch", {
+              phone,
+              tempBooking,
+              buttons: Object.entries(BRANCHES).map(([n, name]) => ({
+                text: name,
+                value: n
+              }))
+            })
+          );
+
+        case "3":
+          tempBooking.modifyType = "date";
+          return res.json(
+            respond("Select new date:", "bookDate", { phone, tempBooking })
+          );
+
+        case "4":
+          tempBooking.modifyType = "time";
+          return res.json(
+            respond("Select new time:", "bookTime", {
+              phone,
+              tempBooking,
+              buttons: generateTimeButtons()
+            })
+          );
+
+        case "5":
+          tempBooking.modifyType = "all";
+          return res.json(
+            respond("Select new services:", "bookService", {
+              phone,
+              tempBooking,
+              buttons: [
+                { text: "Haircut", value: "Haircut" },
+                { text: "Facial", value: "Facial" },
+                { text: "Shave", value: "Shave" },
+                { text: "Hair coloring", value: "Hair coloring" },
+                { text: "Manicure", value: "Manicure" },
+                { text: "Done", value: "__done_services__" }
+              ]
+            })
+          );
+
+        case "6":
+          await pool.query("DELETE FROM appointments WHERE appointment_id=$1", [
+            tempBooking.appointmentId
+          ]);
+          return res.json(
+            respond(
+              "❌ Appointment Cancelled.",
+              "mainMenu",
+              {
+                phone,
+                buttons: [
+                  { text: "📅 Book Appointment", value: "book" },
+                  { text: "👀 View Appointments", value: "view" }
+                ]
+              }
+            )
+          );
+
+        case "7":
+          return res.json(
+            respond(
+              "Back to menu.",
+              "mainMenu",
+              {
+                phone,
+                buttons: [
+                  { text: "📅 Book Appointment", value: "book" },
+                  { text: "👀 View Appointments", value: "view" },
+                  { text: "🛠 Reschedule / Cancel", value: "modify" }
+                ]
+              }
+            )
+          );
+
+        default:
+          return res.json(respond("Select a valid option.", "modifyMenu"));
+      }
+    }
+
+    // -----------------------------------------
+    // SERVICE SELECTION
+    // -----------------------------------------
+    if (step === "bookService") {
+      if (text === "__done_services__") {
+        if (!tempBooking.services.length)
+          return res.json(
+            respond("❌ Select at least one.", "bookService", { phone, tempBooking })
+          );
+
+        tempBooking.totalPrice = calculateTotal(tempBooking.services);
+
+        // MODIFY → ONLY SERVICES
+        if (tempBooking.mode === "modify" && tempBooking.modifyType === "services") {
+          await pool.query(
+            `UPDATE appointments 
+             SET services=$1, total_price=$2 
+             WHERE appointment_id=$3`,
+            [tempBooking.services.join(", "), tempBooking.totalPrice, tempBooking.appointmentId]
+          );
+
+          return res.json(
+            respond("✔ Services updated!", "mainMenu", {
+              phone,
+              buttons: [
+                { text: "📅 Book Another", value: "book" },
+                { text: "👀 View Appointments", value: "view" },
+                { text: "🛠 Modify Again", value: "modify" }
+              ]
+            })
+          );
+        }
+
+        // CHANGE ALL or NEW → NEXT STEP
         return res.json(
-          makeReply(
-            "❌ Please choose a valid branch (1–4).",
-            "bookBranch",
-            { phone, tempBooking }
-          )
+          respond("Choose branch:", "bookBranch", {
+            phone,
+            tempBooking,
+            buttons: Object.entries(BRANCHES).map(([n, name]) => ({
+              text: name,
+              value: n
+            }))
+          })
         );
       }
 
-      // MODIFY → branch only
+      const valid = SERVICE_PRICES[text];
+      if (!valid)
+        return res.json(respond("Tap a valid service.", "bookService", { phone, tempBooking }));
+
+      const idx = tempBooking.services.indexOf(text);
+      if (idx === -1) tempBooking.services.push(text);
+      else tempBooking.services.splice(idx, 1);
+
+      return res.json(
+        respond(`Selected: ${tempBooking.services.join(", ")}`, "bookService", {
+          phone,
+          tempBooking
+        })
+      );
+    }
+
+    // -----------------------------------------
+    // BRANCH
+    // -----------------------------------------
+    if (step === "bookBranch") {
+      const branch = BRANCHES[Number(text)];
+      if (!branch)
+        return res.json(respond("Invalid branch.", "bookBranch", { phone, tempBooking }));
+
+      tempBooking.location = branch;
+
+      // MODIFY → ONLY BRANCH
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "branch") {
         await pool.query(
-          `UPDATE appointments
-           SET location=$1
-           WHERE appointment_id=$2`,
+          `UPDATE appointments SET location=$1 WHERE appointment_id=$2`,
           [branch, tempBooking.appointmentId]
         );
 
         return res.json(
-          restartSession(
-            `✅ Branch updated to ${branch}.`,
-            phone
-          )
+          respond("✔ Branch updated!", "mainMenu", {
+            phone,
+            buttons: [
+              { text: "📅 Book Another", value: "book" },
+              { text: "👀 View Appointments", value: "view" },
+              { text: "🛠 Modify Again", value: "modify" }
+            ]
+          })
         );
       }
 
-      // MODIFY → change all or NEW: store & next
-      tempBooking.location = branch;
-
-      return res.json(
-        makeReply(
-          "📆 Select date (DD-MM-YYYY, within next 30 days).",
-          "bookDate",
-          { phone, tempBooking }
-        )
-      );
+      return res.json(respond("📆 Select date:", "bookDate", { phone, tempBooking }));
     }
 
-    /* STEP: bookDate */
+    // -----------------------------------------
+    // DATE
+    // -----------------------------------------
     if (step === "bookDate") {
-      const d = parseDateDDMMYYYY(text);
+      const d = parseDate(text);
+      if (!d)
+        return res.json(respond("❌ Invalid date.", "bookDate", { phone, tempBooking }));
 
-      if (!d) {
-        return res.json(
-          makeReply(
-            "❌ Please enter a valid date in DD-MM-YYYY within the next 30 days.",
-            "bookDate",
-            { phone, tempBooking }
-          )
-        );
-      }
+      tempBooking.dateISO = d.toISOString().split("T")[0];
 
-      const iso = d.toISOString().split("T")[0];
-
-      // MODIFY → date only
+      // MODIFY → ONLY DATE
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "date") {
         await pool.query(
-          `UPDATE appointments
-           SET appointment_date=$1
-           WHERE appointment_id=$2`,
-          [iso, tempBooking.appointmentId]
+          `UPDATE appointments SET appointment_date=$1 WHERE appointment_id=$2`,
+          [tempBooking.dateISO, tempBooking.appointmentId]
         );
 
         return res.json(
-          restartSession(
-            `✅ Date updated to ${iso}.`,
-            phone
-          )
+          respond("✔ Date updated!", "mainMenu", {
+            phone,
+            buttons: [
+              { text: "📅 Book Another", value: "book" },
+              { text: "👀 View Appointments", value: "view" },
+              { text: "🛠 Modify Again", value: "modify" }
+            ]
+          })
         );
       }
 
-      // MODIFY → change all or NEW
-      tempBooking.dateISO = iso;
-
       return res.json(
-        makeReply(
-          "⏰ Select time between 10AM and 10PM (e.g., 4PM or 16).",
-          "bookTime",
-          { phone, tempBooking }
-        )
+        respond("⏰ Select time:", "bookTime", {
+          phone,
+          tempBooking,
+          buttons: generateTimeButtons()
+        })
       );
     }
 
-    /* STEP: bookTime */
+    // -----------------------------------------
+    // TIME
+    // -----------------------------------------
     if (step === "bookTime") {
-      const parsed = parseTime(text);
+      const validTimes = generateTimeButtons().map(t => t.value);
 
-      if (!parsed) {
-        return res.json(
-          makeReply(
-            "❌ Invalid time format. Try again (e.g., 4PM).",
-            "bookTime",
-            { phone, tempBooking }
-          )
-        );
-      }
+      if (!validTimes.includes(text))
+        return res.json(respond("❌ Select valid time.", "bookTime", {
+          phone,
+          tempBooking,
+          buttons: generateTimeButtons()
+        }));
 
-      const timeLabel = parsed.label;
+      const timeLabel = text;
 
-      // MODIFY → time only
+      // MODIFY → ONLY TIME
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "time") {
         await pool.query(
-          `UPDATE appointments
-           SET appointment_time=$1
+          `UPDATE appointments 
+           SET appointment_time=$1 
            WHERE appointment_id=$2`,
           [timeLabel, tempBooking.appointmentId]
         );
 
         return res.json(
-          restartSession(
-            `✅ Time updated to ${timeLabel}.`,
-            phone
-          )
+          respond("✔ Time updated!", "mainMenu", {
+            phone,
+            buttons: [
+              { text: "📅 Book Another", value: "book" },
+              { text: "👀 View Appointments", value: "view" },
+              { text: "🛠 Modify Again", value: "modify" }
+            ]
+          })
         );
       }
 
-      // MODIFY → change all (final UPDATE)
+      // MODIFY → ALL
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
-        const { services, totalPrice, location, dateISO } = tempBooking;
+        const { services, totalPrice, location, dateISO, appointmentId } = tempBooking;
 
         await pool.query(
           `UPDATE appointments
-           SET services=$1,
-               location=$2,
-               appointment_date=$3,
-               appointment_time=$4,
-               total_price=$5
+           SET services=$1, location=$2, appointment_date=$3, appointment_time=$4, total_price=$5
            WHERE appointment_id=$6`,
           [
             services.join(", "),
@@ -658,154 +580,58 @@ app.post("/chat", async (req, res) => {
             dateISO,
             timeLabel,
             totalPrice,
-            tempBooking.appointmentId,
+            appointmentId
           ]
         );
 
         return res.json(
-          restartSession(
-            "🔄 Appointment fully updated.",
-            phone
-          )
+          respond("✔ Appointment fully updated!", "mainMenu", {
+            phone,
+            buttons: [
+              { text: "📅 Book Another", value: "book" },
+              { text: "👀 View Appointments", value: "view" },
+              { text: "🛠 Modify Again", value: "modify" }
+            ]
+          })
         );
       }
 
-      // NEW booking → INSERT
+      // NEW BOOKING
       const { services, totalPrice, location, dateISO } = tempBooking;
 
       await pool.query(
         `INSERT INTO appointments
          (customer_phone, services, location, appointment_date, appointment_time, total_price, status)
-         VALUES ($1,$2,$3,$4,$5,$6,'booked')`,
-        [phone, services.join(", "), location, dateISO, timeLabel, totalPrice]
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [phone, services.join(", "), location, dateISO, timeLabel, totalPrice, "booked"]
       );
 
       return res.json(
-        restartSession(
-          "🎉 Appointment confirmed!",
-          phone
-        )
+        respond("🎉 Appointment Confirmed!", "mainMenu", {
+          phone,
+          buttons: [
+            { text: "📅 Book Another", value: "book" },
+            { text: "👀 View Appointments", value: "view" },
+            { text: "🛠 Reschedule / Cancel", value: "modify" }
+          ]
+        })
       );
     }
 
-    // fallback
-    return res.json(
-      makeReply(
-        "Something went wrong... starting again.\nEnter phone number:",
-        "phone"
-      )
-    );
+    // -----------------------------------------
+    // FALLBACK
+    // -----------------------------------------
+    return res.json(respond("Let's start again! Enter phone number:", "phone"));
 
   } catch (err) {
-    console.error("chat error:", err);
-    return res.status(500).json(
-      makeReply(
-        "Server error. Please try again.",
-        "phone"
-      )
-    );
+    console.error("SERVER ERROR:", err);
+    return res.status(500).json(respond("⚠ Server error.", "phone"));
   }
 });
 
-/* ---------------------------------
-   WHATSAPP WEBHOOK (stub for now)
-   - GET /webhook : verification
-   - POST /webhook: basic reply
------------------------------------*/
-
-// Verification endpoint for Meta
-app.get("/webhook", (req, res) => {
-  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === verifyToken) {
-    console.log("✅ WhatsApp webhook verified");
-    res.status(200).send(challenge);
-  } else {
-    console.log("❌ WhatsApp webhook verification failed");
-    res.sendStatus(403);
-  }
-});
-
-// Main WhatsApp webhook receiver
-app.post("/webhook", async (req, res) => {
-  try {
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const message = value?.messages?.[0];
-
-    if (!message) {
-      return res.sendStatus(200);
-    }
-
-    const from = message.from; // WhatsApp phone
-    const textBody = message.text?.body || "";
-
-    console.log("📲 WhatsApp message:", from, "→", textBody);
-
-    // For now, just send a simple reply.
-    // Later we can hook this into the same booking logic.
-    const reply =
-      "Hi from Mithil's Salon WhatsApp bot 💇‍♂️\n\n" +
-      "Right now this number is connected in test mode.\n" +
-      "Website chatbot is fully working — WhatsApp flow coming soon!";
-
-    await sendWhatsAppMessage(from, reply);
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("whatsapp webhook error:", err.response?.data || err.message);
-    res.sendStatus(500);
-  }
-});
-
-// Helper: send WhatsApp message using Cloud API
-async function sendWhatsAppMessage(to, message) {
-  const token = process.env.WHATSAPP_TOKEN;
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-
-  if (!token || !phoneNumberId) {
-    console.warn("⚠️ WhatsApp env vars missing, not sending message");
-    return;
-  }
-
-  const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
-
-  try {
-    await axios.post(
-      url,
-      {
-        messaging_product: "whatsapp",
-        to,
-        text: { body: message },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    console.log("✅ WhatsApp message sent to", to);
-  } catch (err) {
-    console.error(
-      "❌ Error sending WhatsApp message:",
-      err.response?.data || err.message
-    );
-  }
-}
-
-/* ---------------------------------
-   START SERVER
------------------------------------*/
-
+// -----------------------------------------
 const PORT = process.env.PORT || 3000;
-
 await connectDB();
-app.listen(PORT, () => {
-  console.log(`🚀 Server running → http://localhost:${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`🚀 Salon Bot running → http://localhost:${PORT}`)
+);
