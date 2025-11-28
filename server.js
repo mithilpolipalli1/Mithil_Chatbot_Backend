@@ -1,14 +1,17 @@
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
 import { pool, connectDB } from "./db.js";
+
+dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// -----------------------------------------
-// CONSTANTS
-// -----------------------------------------
+/* -----------------------------------------
+   CONSTANTS
+--------------------------------------------*/
 const SERVICE_PRICES = {
   "Haircut": 300,
   "Facial": 400,
@@ -39,20 +42,18 @@ function calculateTotal(services) {
   return services.reduce((sum, s) => sum + (SERVICE_PRICES[s] || 0), 0);
 }
 
-// -----------------------------------------
-// DATE / TIME HELPERS
-// -----------------------------------------
+/* -----------------------------------------
+   DATE/TIME HELPERS
+--------------------------------------------*/
 function parseDate(input) {
   const t = input.trim();
   let parts;
 
-  // DD-MM-YYYY
   if (/^\d{2}-\d{2}-\d{4}$/.test(t)) {
     parts = t.split("-").map(Number);
     return new Date(parts[2], parts[1] - 1, parts[0]);
   }
 
-  // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) {
     parts = t.split("-").map(Number);
     return new Date(parts[0], parts[1] - 1, parts[2]);
@@ -76,10 +77,11 @@ function generateTimeButtons() {
   });
 }
 
-// -----------------------------------------
-// MAIN ROUTE
-// -----------------------------------------
-app.post("/chat", async (req, res) => {
+/* -----------------------------------------
+   MAIN CHATBOT ROUTE (IMPORTANT)
+   NOW USING:  /api/chat
+--------------------------------------------*/
+app.post("/api/chat", async (req, res) => {
   try {
     let { text, step, phone, tempBooking } = req.body;
 
@@ -89,9 +91,9 @@ app.post("/chat", async (req, res) => {
     tempBooking = tempBooking || {};
     tempBooking.services = tempBooking.services || [];
 
-    // -----------------------------------------
-    // PHONE LOGIN
-    // -----------------------------------------
+    /* ------------------------------
+       PHONE LOGIN
+    -------------------------------*/
     if (step === "phone") {
       const digits = text.replace(/\D/g, "");
       if (digits.length !== 10)
@@ -128,9 +130,9 @@ app.post("/chat", async (req, res) => {
       );
     }
 
-    // -----------------------------------------
-    // NEW USER NAME
-    // -----------------------------------------
+    /* ------------------------------
+       NEW USER NAME
+    -------------------------------*/
     if (step === "newUserName") {
       const name = text;
 
@@ -155,9 +157,9 @@ app.post("/chat", async (req, res) => {
       );
     }
 
-    // -----------------------------------------
-    // MAIN MENU
-    // -----------------------------------------
+    /* ------------------------------
+       MAIN MENU
+    -------------------------------*/
     if (step === "mainMenu") {
       if (text === "book") {
         tempBooking = { mode: "new", services: [] };
@@ -243,13 +245,12 @@ app.post("/chat", async (req, res) => {
       return res.json(respond("Choose a valid option.", "mainMenu"));
     }
 
-    // -----------------------------------------
-    // MODIFY PICK
-    // -----------------------------------------
+    /* ------------------------------
+       MODIFY PICK
+    -------------------------------*/
     if (step === "modifyPick") {
       const result = await pool.query(
-        `SELECT * FROM appointments 
-         WHERE customer_phone=$1`,
+        `SELECT * FROM appointments WHERE customer_phone=$1`,
         [phone]
       );
 
@@ -290,11 +291,10 @@ app.post("/chat", async (req, res) => {
       );
     }
 
-    // -----------------------------------------
-    // MODIFY MENU
-    // -----------------------------------------
+    /* ------------------------------
+       MODIFY MENU
+    -------------------------------*/
     if (step === "modifyMenu") {
-      // Set modify type
       switch (text) {
         case "1":
           tempBooking.modifyType = "services";
@@ -360,37 +360,30 @@ app.post("/chat", async (req, res) => {
           );
 
         case "6":
-          await pool.query("DELETE FROM appointments WHERE appointment_id=$1", [
-            tempBooking.appointmentId
-          ]);
+          await pool.query(
+            "DELETE FROM appointments WHERE appointment_id=$1",
+            [tempBooking.appointmentId]
+          );
           return res.json(
-            respond(
-              "❌ Appointment Cancelled.",
-              "mainMenu",
-              {
-                phone,
-                buttons: [
-                  { text: "📅 Book Appointment", value: "book" },
-                  { text: "👀 View Appointments", value: "view" }
-                ]
-              }
-            )
+            respond("❌ Appointment Cancelled.", "mainMenu", {
+              phone,
+              buttons: [
+                { text: "📅 Book Appointment", value: "book" },
+                { text: "👀 View Appointments", value: "view" }
+              ]
+            })
           );
 
         case "7":
           return res.json(
-            respond(
-              "Back to menu.",
-              "mainMenu",
-              {
-                phone,
-                buttons: [
-                  { text: "📅 Book Appointment", value: "book" },
-                  { text: "👀 View Appointments", value: "view" },
-                  { text: "🛠 Reschedule / Cancel", value: "modify" }
-                ]
-              }
-            )
+            respond("Back to menu.", "mainMenu", {
+              phone,
+              buttons: [
+                { text: "📅 Book Appointment", value: "book" },
+                { text: "👀 View Appointments", value: "view" },
+                { text: "🛠 Reschedule / Cancel", value: "modify" }
+              ]
+            })
           );
 
         default:
@@ -398,9 +391,9 @@ app.post("/chat", async (req, res) => {
       }
     }
 
-    // -----------------------------------------
-    // SERVICE SELECTION
-    // -----------------------------------------
+    /* ------------------------------
+       SERVICE SELECTION
+    -------------------------------*/
     if (step === "bookService") {
       if (text === "__done_services__") {
         if (!tempBooking.services.length)
@@ -410,13 +403,16 @@ app.post("/chat", async (req, res) => {
 
         tempBooking.totalPrice = calculateTotal(tempBooking.services);
 
-        // MODIFY → ONLY SERVICES
         if (tempBooking.mode === "modify" && tempBooking.modifyType === "services") {
           await pool.query(
             `UPDATE appointments 
              SET services=$1, total_price=$2 
              WHERE appointment_id=$3`,
-            [tempBooking.services.join(", "), tempBooking.totalPrice, tempBooking.appointmentId]
+            [
+              tempBooking.services.join(", "),
+              tempBooking.totalPrice,
+              tempBooking.appointmentId
+            ]
           );
 
           return res.json(
@@ -431,7 +427,6 @@ app.post("/chat", async (req, res) => {
           );
         }
 
-        // CHANGE ALL or NEW → NEXT STEP
         return res.json(
           respond("Choose branch:", "bookBranch", {
             phone,
@@ -460,9 +455,9 @@ app.post("/chat", async (req, res) => {
       );
     }
 
-    // -----------------------------------------
-    // BRANCH
-    // -----------------------------------------
+    /* ------------------------------
+       BRANCH
+    -------------------------------*/
     if (step === "bookBranch") {
       const branch = BRANCHES[Number(text)];
       if (!branch)
@@ -470,7 +465,6 @@ app.post("/chat", async (req, res) => {
 
       tempBooking.location = branch;
 
-      // MODIFY → ONLY BRANCH
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "branch") {
         await pool.query(
           `UPDATE appointments SET location=$1 WHERE appointment_id=$2`,
@@ -492,9 +486,9 @@ app.post("/chat", async (req, res) => {
       return res.json(respond("📆 Select date:", "bookDate", { phone, tempBooking }));
     }
 
-    // -----------------------------------------
-    // DATE
-    // -----------------------------------------
+    /* ------------------------------
+       DATE
+    -------------------------------*/
     if (step === "bookDate") {
       const d = parseDate(text);
       if (!d)
@@ -502,7 +496,6 @@ app.post("/chat", async (req, res) => {
 
       tempBooking.dateISO = d.toISOString().split("T")[0];
 
-      // MODIFY → ONLY DATE
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "date") {
         await pool.query(
           `UPDATE appointments SET appointment_date=$1 WHERE appointment_id=$2`,
@@ -530,22 +523,23 @@ app.post("/chat", async (req, res) => {
       );
     }
 
-    // -----------------------------------------
-    // TIME
-    // -----------------------------------------
+    /* ------------------------------
+       TIME
+    -------------------------------*/
     if (step === "bookTime") {
       const validTimes = generateTimeButtons().map(t => t.value);
 
       if (!validTimes.includes(text))
-        return res.json(respond("❌ Select valid time.", "bookTime", {
-          phone,
-          tempBooking,
-          buttons: generateTimeButtons()
-        }));
+        return res.json(
+          respond("❌ Select valid time.", "bookTime", {
+            phone,
+            tempBooking,
+            buttons: generateTimeButtons()
+          })
+        );
 
       const timeLabel = text;
 
-      // MODIFY → ONLY TIME
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "time") {
         await pool.query(
           `UPDATE appointments 
@@ -566,7 +560,6 @@ app.post("/chat", async (req, res) => {
         );
       }
 
-      // MODIFY → ALL
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
         const { services, totalPrice, location, dateISO, appointmentId } = tempBooking;
 
@@ -596,7 +589,6 @@ app.post("/chat", async (req, res) => {
         );
       }
 
-      // NEW BOOKING
       const { services, totalPrice, location, dateISO } = tempBooking;
 
       await pool.query(
@@ -618,9 +610,9 @@ app.post("/chat", async (req, res) => {
       );
     }
 
-    // -----------------------------------------
-    // FALLBACK
-    // -----------------------------------------
+    /* ------------------------------
+       FALLBACK
+    -------------------------------*/
     return res.json(respond("Let's start again! Enter phone number:", "phone"));
 
   } catch (err) {
@@ -629,9 +621,12 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// -----------------------------------------
-const PORT = process.env.PORT || 3000;
+/* -----------------------------------------
+   START SERVER
+--------------------------------------------*/
 await connectDB();
+
+const PORT = 5000;
 app.listen(PORT, () =>
-  console.log(`🚀 Salon Bot running → http://localhost:${PORT}`)
+  console.log(`🚀 Salon Bot API running on port ${PORT}`)
 );
