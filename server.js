@@ -6,7 +6,18 @@ import { pool, connectDB } from "./db.js";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+// ------------------- NEW LINE ADDED HERE -------------------
+const API_BASE_URL = "https://aiagent.zasya.online";
+// -----------------------------------------------------------
+
+// CORS: allow your domain
+app.use(cors({
+  origin: API_BASE_URL,
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"]
+}));
+
 app.use(express.json());
 
 /* -----------------------------------------
@@ -78,8 +89,7 @@ function generateTimeButtons() {
 }
 
 /* -----------------------------------------
-   MAIN CHATBOT ROUTE (IMPORTANT)
-   NOW USING:  /api/chat
+   MAIN CHATBOT ROUTE  (/api/chat)
 --------------------------------------------*/
 app.post("/api/chat", async (req, res) => {
   try {
