@@ -1,41 +1,90 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import axios from "axios";
 import { pool, connectDB } from "./db.js";
 
 dotenv.config();
 
 const app = express();
-
-// ------------------- NEW LINE ADDED HERE -------------------
-const API_BASE_URL = "https://aiagent.zasya.online";
-// -----------------------------------------------------------
-
-// CORS: allow your domain
-app.use(cors({
-  origin: API_BASE_URL,
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"]
-}));
-
 app.use(express.json());
+
+/* -----------------------------------------
+   CORS (allow your frontend domain)
+--------------------------------------------*/
+const API_BASE_URL = process.env.FRONTEND_URL || "*";
+
+app.use(
+  cors({
+    origin: API_BASE_URL,
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+
+/* -----------------------------------------
+   MSG91 WEBHOOK
+--------------------------------------------*/
+app.post("/webhook", async (req, res) => {
+  try {
+    const data = req.body;
+
+    const from = data.sender;
+    const text = data.message;
+
+    // Forward message into chatbot logic
+    const botResponse = await axios.post("http://localhost:8011/api/chat", {
+      text,
+      phone: from,
+    });
+
+    const reply = botResponse.data.reply;
+
+    // Send reply back through MSG91
+    await sendMsg91Message(from, reply);
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Webhook Error:", err);
+    res.sendStatus(500);
+  }
+});
+
+async function sendMsg91Message(to, message) {
+  const apiKey = process.env.MSG91_API_KEY;
+
+  await axios.post(
+    "https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound",
+    {
+      to,
+      type: "text",
+      message,
+    },
+    {
+      headers: {
+        authkey: apiKey,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+}
 
 /* -----------------------------------------
    CONSTANTS
 --------------------------------------------*/
 const SERVICE_PRICES = {
-  "Haircut": 300,
-  "Facial": 400,
-  "Shave": 150,
+  Haircut: 300,
+  Facial: 400,
+  Shave: 150,
   "Hair coloring": 500,
-  "Manicure": 350
+  Manicure: 350,
 };
 
 const BRANCHES = {
   1: "Miyapur",
   2: "Madhapur",
   3: "Jubilee Hills",
-  4: "Banjara Hills"
+  4: "Banjara Hills",
 };
 
 function greetUser() {
@@ -101,9 +150,7 @@ app.post("/api/chat", async (req, res) => {
     tempBooking = tempBooking || {};
     tempBooking.services = tempBooking.services || [];
 
-    /* ------------------------------
-       PHONE LOGIN
-    -------------------------------*/
+    /* PHONE LOGIN */
     if (step === "phone") {
       const digits = text.replace(/\D/g, "");
       if (digits.length !== 10)
@@ -111,27 +158,22 @@ app.post("/api/chat", async (req, res) => {
 
       phone = digits;
 
-      const result = await pool.query(
-        "SELECT * FROM salon_users WHERE phone=$1",
-        [phone]
-      );
+      const result = await pool.query("SELECT * FROM salon_users WHERE phone=$1", [
+        phone,
+      ]);
 
       const greet = greetUser();
 
       if (result.rows.length > 0) {
         return res.json(
-          respond(
-            `${greet} ${result.rows[0].name}! 👋`,
-            "mainMenu",
-            {
-              phone,
-              buttons: [
-                { text: "📅 Book Appointment", value: "book" },
-                { text: "👀 View Appointments", value: "view" },
-                { text: "🛠 Reschedule / Cancel", value: "modify" }
-              ]
-            }
-          )
+          respond(`${greet} ${result.rows[0].name}! 👋`, "mainMenu", {
+            phone,
+            buttons: [
+              { text: "📅 Book Appointment", value: "book" },
+              { text: "👀 View Appointments", value: "view" },
+              { text: "🛠 Reschedule / Cancel", value: "modify" },
+            ],
+          })
         );
       }
 
@@ -140,96 +182,77 @@ app.post("/api/chat", async (req, res) => {
       );
     }
 
-    /* ------------------------------
-       NEW USER NAME
-    -------------------------------*/
+    /* NEW USER NAME */
     if (step === "newUserName") {
       const name = text;
 
-      await pool.query(
-        "INSERT INTO salon_users (phone, name) VALUES ($1,$2)",
-        [phone, name]
-      );
+      await pool.query("INSERT INTO salon_users (phone, name) VALUES ($1,$2)", [
+        phone,
+        name,
+      ]);
 
       return res.json(
-        respond(
-          `🎉 Welcome ${name}! You get 50% OFF on your first service.`,
-          "mainMenu",
-          {
-            phone,
-            buttons: [
-              { text: "📅 Book Appointment", value: "book" },
-              { text: "👀 View Appointments", value: "view" },
-              { text: "🛠 Reschedule / Cancel", value: "modify" }
-            ]
-          }
-        )
+        respond(`🎉 Welcome ${name}! You get 50% OFF on your first service.`, "mainMenu", {
+          phone,
+          buttons: [
+            { text: "📅 Book Appointment", value: "book" },
+            { text: "👀 View Appointments", value: "view" },
+            { text: "🛠 Reschedule / Cancel", value: "modify" },
+          ],
+        })
       );
     }
 
-    /* ------------------------------
-       MAIN MENU
-    -------------------------------*/
+    /* MAIN MENU */
     if (step === "mainMenu") {
       if (text === "book") {
         tempBooking = { mode: "new", services: [] };
         return res.json(
-          respond(
-            "Select services:",
-            "bookService",
-            {
-              phone,
-              tempBooking,
-              buttons: [
-                { text: "Haircut", value: "Haircut" },
-                { text: "Facial", value: "Facial" },
-                { text: "Shave", value: "Shave" },
-                { text: "Hair coloring", value: "Hair coloring" },
-                { text: "Manicure", value: "Manicure" },
-                { text: "Done", value: "__done_services__" }
-              ]
-            }
-          )
+          respond("Select services:", "bookService", {
+            phone,
+            tempBooking,
+            buttons: [
+              { text: "Haircut", value: "Haircut" },
+              { text: "Facial", value: "Facial" },
+              { text: "Shave", value: "Shave" },
+              { text: "Hair coloring", value: "Hair coloring" },
+              { text: "Manicure", value: "Manicure" },
+              { text: "Done", value: "__done_services__" },
+            ],
+          })
         );
       }
 
       if (text === "view") {
         const result = await pool.query(
-          `SELECT * FROM appointments 
-           WHERE customer_phone=$1
-           ORDER BY appointment_date, appointment_time`,
+          `SELECT * FROM appointments WHERE customer_phone=$1 ORDER BY appointment_date, appointment_time`,
           [phone]
         );
 
         if (!result.rows.length)
           return res.json(respond("📭 You have no appointments.", "mainMenu", { phone }));
 
-        const formatted = result.rows.map((a, i) =>
-          `${i + 1}) ${a.services} at ${a.location} on ${a.appointment_date
-            .toISOString()
-            .split("T")[0]} ${a.appointment_time} — ₹${a.total_price}`
+        const formatted = result.rows.map(
+          (a, i) =>
+            `${i + 1}) ${a.services} at ${a.location} on ${a.appointment_date
+              .toISOString()
+              .split("T")[0]} ${a.appointment_time} — ₹${a.total_price}`
         );
 
         return res.json(
-          respond(
-            `📋 Your Appointments:\n\n${formatted.join("\n")}`,
-            "mainMenu",
-            {
-              phone,
-              buttons: [
-                { text: "📅 Book Another", value: "book" },
-                { text: "🛠 Reschedule / Cancel", value: "modify" }
-              ]
-            }
-          )
+          respond(`📋 Your Appointments:\n\n${formatted.join("\n")}`, "mainMenu", {
+            phone,
+            buttons: [
+              { text: "📅 Book Another", value: "book" },
+              { text: "🛠 Reschedule / Cancel", value: "modify" },
+            ],
+          })
         );
       }
 
       if (text === "modify") {
         const result = await pool.query(
-          `SELECT * FROM appointments 
-           WHERE customer_phone=$1
-           ORDER BY appointment_date, appointment_time`,
+          `SELECT * FROM appointments WHERE customer_phone=$1 ORDER BY appointment_date, appointment_time`,
           [phone]
         );
 
@@ -237,32 +260,25 @@ app.post("/api/chat", async (req, res) => {
           return res.json(respond("📭 No appointments to modify.", "mainMenu", { phone }));
 
         return res.json(
-          respond(
-            "Select appointment to modify:",
-            "modifyPick",
-            {
-              phone,
-              appointments: result.rows,
-              buttons: result.rows.map((a, i) => ({
-                text: `${i + 1}) ${a.services} (${a.location})`,
-                value: String(i + 1)
-              }))
-            }
-          )
+          respond("Select appointment to modify:", "modifyPick", {
+            phone,
+            appointments: result.rows,
+            buttons: result.rows.map((a, i) => ({
+              text: `${i + 1}) ${a.services} (${a.location})`,
+              value: String(i + 1),
+            })),
+          })
         );
       }
 
       return res.json(respond("Choose a valid option.", "mainMenu"));
     }
 
-    /* ------------------------------
-       MODIFY PICK
-    -------------------------------*/
+    /* SELECT APPOINTMENT */
     if (step === "modifyPick") {
-      const result = await pool.query(
-        `SELECT * FROM appointments WHERE customer_phone=$1`,
-        [phone]
-      );
+      const result = await pool.query("SELECT * FROM appointments WHERE customer_phone=$1", [
+        phone,
+      ]);
 
       const idx = Number(text) - 1;
       if (idx < 0 || idx >= result.rows.length)
@@ -277,33 +293,27 @@ app.post("/api/chat", async (req, res) => {
         location: a.location,
         dateISO: a.appointment_date.toISOString().split("T")[0],
         timeLabel: a.appointment_time,
-        totalPrice: a.total_price
+        totalPrice: a.total_price,
       };
 
       return res.json(
-        respond(
-          "What would you like to modify?",
-          "modifyMenu",
-          {
-            phone,
-            tempBooking,
-            buttons: [
-              { text: "✂ Change Services", value: "1" },
-              { text: "📍 Change Branch", value: "2" },
-              { text: "📆 Change Date", value: "3" },
-              { text: "⏰ Change Time", value: "4" },
-              { text: "🔄 Change All", value: "5" },
-              { text: "❌ Cancel Appointment", value: "6" },
-              { text: "⬅ Back", value: "7" }
-            ]
-          }
-        )
+        respond("What would you like to modify?", "modifyMenu", {
+          phone,
+          tempBooking,
+          buttons: [
+            { text: "✂ Change Services", value: "1" },
+            { text: "📍 Change Branch", value: "2" },
+            { text: "📆 Change Date", value: "3" },
+            { text: "⏰ Change Time", value: "4" },
+            { text: "🔄 Change All", value: "5" },
+            { text: "❌ Cancel Appointment", value: "6" },
+            { text: "⬅ Back", value: "7" },
+          ],
+        })
       );
     }
 
-    /* ------------------------------
-       MODIFY MENU
-    -------------------------------*/
+    /* MODIFY MENU */
     if (step === "modifyMenu") {
       switch (text) {
         case "1":
@@ -318,8 +328,8 @@ app.post("/api/chat", async (req, res) => {
                 { text: "Shave", value: "Shave" },
                 { text: "Hair coloring", value: "Hair coloring" },
                 { text: "Manicure", value: "Manicure" },
-                { text: "Done", value: "__done_services__" }
-              ]
+                { text: "Done", value: "__done_services__" },
+              ],
             })
           );
 
@@ -331,8 +341,8 @@ app.post("/api/chat", async (req, res) => {
               tempBooking,
               buttons: Object.entries(BRANCHES).map(([n, name]) => ({
                 text: name,
-                value: n
-              }))
+                value: n,
+              })),
             })
           );
 
@@ -348,7 +358,7 @@ app.post("/api/chat", async (req, res) => {
             respond("Select new time:", "bookTime", {
               phone,
               tempBooking,
-              buttons: generateTimeButtons()
+              buttons: generateTimeButtons(),
             })
           );
 
@@ -364,23 +374,22 @@ app.post("/api/chat", async (req, res) => {
                 { text: "Shave", value: "Shave" },
                 { text: "Hair coloring", value: "Hair coloring" },
                 { text: "Manicure", value: "Manicure" },
-                { text: "Done", value: "__done_services__" }
-              ]
+                { text: "Done", value: "__done_services__" },
+              ],
             })
           );
 
         case "6":
-          await pool.query(
-            "DELETE FROM appointments WHERE appointment_id=$1",
-            [tempBooking.appointmentId]
-          );
+          await pool.query("DELETE FROM appointments WHERE appointment_id=$1", [
+            tempBooking.appointmentId,
+          ]);
           return res.json(
             respond("❌ Appointment Cancelled.", "mainMenu", {
               phone,
               buttons: [
                 { text: "📅 Book Appointment", value: "book" },
-                { text: "👀 View Appointments", value: "view" }
-              ]
+                { text: "👀 View Appointments", value: "view" },
+              ],
             })
           );
 
@@ -391,8 +400,8 @@ app.post("/api/chat", async (req, res) => {
               buttons: [
                 { text: "📅 Book Appointment", value: "book" },
                 { text: "👀 View Appointments", value: "view" },
-                { text: "🛠 Reschedule / Cancel", value: "modify" }
-              ]
+                { text: "🛠 Reschedule / Cancel", value: "modify" },
+              ],
             })
           );
 
@@ -401,9 +410,7 @@ app.post("/api/chat", async (req, res) => {
       }
     }
 
-    /* ------------------------------
-       SERVICE SELECTION
-    -------------------------------*/
+    /* SERVICE SELECTION */
     if (step === "bookService") {
       if (text === "__done_services__") {
         if (!tempBooking.services.length)
@@ -415,13 +422,11 @@ app.post("/api/chat", async (req, res) => {
 
         if (tempBooking.mode === "modify" && tempBooking.modifyType === "services") {
           await pool.query(
-            `UPDATE appointments 
-             SET services=$1, total_price=$2 
-             WHERE appointment_id=$3`,
+            `UPDATE appointments SET services=$1, total_price=$2 WHERE appointment_id=$3`,
             [
               tempBooking.services.join(", "),
               tempBooking.totalPrice,
-              tempBooking.appointmentId
+              tempBooking.appointmentId,
             ]
           );
 
@@ -431,8 +436,8 @@ app.post("/api/chat", async (req, res) => {
               buttons: [
                 { text: "📅 Book Another", value: "book" },
                 { text: "👀 View Appointments", value: "view" },
-                { text: "🛠 Modify Again", value: "modify" }
-              ]
+                { text: "🛠 Modify Again", value: "modify" },
+              ],
             })
           );
         }
@@ -443,15 +448,20 @@ app.post("/api/chat", async (req, res) => {
             tempBooking,
             buttons: Object.entries(BRANCHES).map(([n, name]) => ({
               text: name,
-              value: n
-            }))
+              value: n,
+            })),
           })
         );
       }
 
       const valid = SERVICE_PRICES[text];
       if (!valid)
-        return res.json(respond("Tap a valid service.", "bookService", { phone, tempBooking }));
+        return res.json(
+          respond("Tap a valid service.", "bookService", {
+            phone,
+            tempBooking,
+          })
+        );
 
       const idx = tempBooking.services.indexOf(text);
       if (idx === -1) tempBooking.services.push(text);
@@ -460,26 +470,26 @@ app.post("/api/chat", async (req, res) => {
       return res.json(
         respond(`Selected: ${tempBooking.services.join(", ")}`, "bookService", {
           phone,
-          tempBooking
+          tempBooking,
         })
       );
     }
 
-    /* ------------------------------
-       BRANCH
-    -------------------------------*/
+    /* BRANCH */
     if (step === "bookBranch") {
       const branch = BRANCHES[Number(text)];
       if (!branch)
-        return res.json(respond("Invalid branch.", "bookBranch", { phone, tempBooking }));
+        return res.json(
+          respond("Invalid branch.", "bookBranch", { phone, tempBooking })
+        );
 
       tempBooking.location = branch;
 
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "branch") {
-        await pool.query(
-          `UPDATE appointments SET location=$1 WHERE appointment_id=$2`,
-          [branch, tempBooking.appointmentId]
-        );
+        await pool.query("UPDATE appointments SET location=$1 WHERE appointment_id=$2", [
+          branch,
+          tempBooking.appointmentId,
+        ]);
 
         return res.json(
           respond("✔ Branch updated!", "mainMenu", {
@@ -487,8 +497,8 @@ app.post("/api/chat", async (req, res) => {
             buttons: [
               { text: "📅 Book Another", value: "book" },
               { text: "👀 View Appointments", value: "view" },
-              { text: "🛠 Modify Again", value: "modify" }
-            ]
+              { text: "🛠 Modify Again", value: "modify" },
+            ],
           })
         );
       }
@@ -496,13 +506,13 @@ app.post("/api/chat", async (req, res) => {
       return res.json(respond("📆 Select date:", "bookDate", { phone, tempBooking }));
     }
 
-    /* ------------------------------
-       DATE
-    -------------------------------*/
+    /* DATE */
     if (step === "bookDate") {
       const d = parseDate(text);
       if (!d)
-        return res.json(respond("❌ Invalid date.", "bookDate", { phone, tempBooking }));
+        return res.json(
+          respond("❌ Invalid date.", "bookDate", { phone, tempBooking })
+        );
 
       tempBooking.dateISO = d.toISOString().split("T")[0];
 
@@ -518,8 +528,8 @@ app.post("/api/chat", async (req, res) => {
             buttons: [
               { text: "📅 Book Another", value: "book" },
               { text: "👀 View Appointments", value: "view" },
-              { text: "🛠 Modify Again", value: "modify" }
-            ]
+              { text: "🛠 Modify Again", value: "modify" },
+            ],
           })
         );
       }
@@ -528,23 +538,21 @@ app.post("/api/chat", async (req, res) => {
         respond("⏰ Select time:", "bookTime", {
           phone,
           tempBooking,
-          buttons: generateTimeButtons()
+          buttons: generateTimeButtons(),
         })
       );
     }
 
-    /* ------------------------------
-       TIME
-    -------------------------------*/
+    /* TIME */
     if (step === "bookTime") {
-      const validTimes = generateTimeButtons().map(t => t.value);
+      const validTimes = generateTimeButtons().map((t) => t.value);
 
       if (!validTimes.includes(text))
         return res.json(
           respond("❌ Select valid time.", "bookTime", {
             phone,
             tempBooking,
-            buttons: generateTimeButtons()
+            buttons: generateTimeButtons(),
           })
         );
 
@@ -552,9 +560,7 @@ app.post("/api/chat", async (req, res) => {
 
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "time") {
         await pool.query(
-          `UPDATE appointments 
-           SET appointment_time=$1 
-           WHERE appointment_id=$2`,
+          `UPDATE appointments SET appointment_time=$1 WHERE appointment_id=$2`,
           [timeLabel, tempBooking.appointmentId]
         );
 
@@ -564,26 +570,25 @@ app.post("/api/chat", async (req, res) => {
             buttons: [
               { text: "📅 Book Another", value: "book" },
               { text: "👀 View Appointments", value: "view" },
-              { text: "🛠 Modify Again", value: "modify" }
-            ]
+              { text: "🛠 Modify Again", value: "modify" },
+            ],
           })
         );
       }
 
       if (tempBooking.mode === "modify" && tempBooking.modifyType === "all") {
-        const { services, totalPrice, location, dateISO, appointmentId } = tempBooking;
+        const { services, totalPrice, location, dateISO, appointmentId } =
+          tempBooking;
 
         await pool.query(
-          `UPDATE appointments
-           SET services=$1, location=$2, appointment_date=$3, appointment_time=$4, total_price=$5
-           WHERE appointment_id=$6`,
+          `UPDATE appointments SET services=$1, location=$2, appointment_date=$3, appointment_time=$4, total_price=$5 WHERE appointment_id=$6`,
           [
             services.join(", "),
             location,
             dateISO,
             timeLabel,
             totalPrice,
-            appointmentId
+            appointmentId,
           ]
         );
 
@@ -593,19 +598,24 @@ app.post("/api/chat", async (req, res) => {
             buttons: [
               { text: "📅 Book Another", value: "book" },
               { text: "👀 View Appointments", value: "view" },
-              { text: "🛠 Modify Again", value: "modify" }
-            ]
+              { text: "🛠 Modify Again", value: "modify" },
+            ],
           })
         );
       }
 
-      const { services, totalPrice, location, dateISO } = tempBooking;
-
       await pool.query(
-        `INSERT INTO appointments
-         (customer_phone, services, location, appointment_date, appointment_time, total_price, status)
+        `INSERT INTO appointments (customer_phone, services, location, appointment_date, appointment_time, total_price, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [phone, services.join(", "), location, dateISO, timeLabel, totalPrice, "booked"]
+        [
+          phone,
+          tempBooking.services.join(", "),
+          tempBooking.location,
+          tempBooking.dateISO,
+          timeLabel,
+          tempBooking.totalPrice,
+          "booked",
+        ]
       );
 
       return res.json(
@@ -614,17 +624,13 @@ app.post("/api/chat", async (req, res) => {
           buttons: [
             { text: "📅 Book Another", value: "book" },
             { text: "👀 View Appointments", value: "view" },
-            { text: "🛠 Reschedule / Cancel", value: "modify" }
-          ]
+            { text: "🛠 Reschedule / Cancel", value: "modify" },
+          ],
         })
       );
     }
 
-    /* ------------------------------
-       FALLBACK
-    -------------------------------*/
     return res.json(respond("Let's start again! Enter phone number:", "phone"));
-
   } catch (err) {
     console.error("SERVER ERROR:", err);
     return res.status(500).json(respond("⚠ Server error.", "phone"));
@@ -636,7 +642,6 @@ app.post("/api/chat", async (req, res) => {
 --------------------------------------------*/
 await connectDB();
 
-const PORT = 5000;
-app.listen(PORT, () =>
-  console.log(`🚀 Salon Bot API running on port ${PORT}`)
-);
+const PORT = process.env.PORT || 8011;
+
+app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));

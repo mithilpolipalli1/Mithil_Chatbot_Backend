@@ -3,55 +3,49 @@ import axios from "axios";
 
 const router = express.Router();
 
-// VERIFY WEBHOOK (required by Meta)
-router.get("/webhook", (req, res) => {
-  const verify_token = process.env.WHATSAPP_VERIFY_TOKEN;
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === verify_token) {
-    console.log("Webhook verified");
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
-
-// RECEIVE MESSAGES
+// MSG91 always sends POST → no verification required
 router.post("/webhook", async (req, res) => {
-  const data = req.body;
+  try {
+    const data = req.body;
 
-  if (data.object) {
-    const message = data.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const from = data.sender;
+    const text = data.message;
 
-    if (message && message.type === "text") {
-      const from = message.from;
-      const text = message.text.body;
+    // Send to your AI logic inside server.js
+    const botResponse = await axios.post("http://localhost:8011/api/chat", {
+      text,
+      phone: from
+    });
 
-      // Reply logic here
-      await sendMessage(from, "Hello! Reply received: " + text);
-    }
+    const reply = botResponse.data.reply;
+
+    // Send reply back to MSG91 WhatsApp
+    await sendMsg91Message(from, reply);
+
     res.sendStatus(200);
-  } else {
-    res.sendStatus(404);
+  } catch (err) {
+    console.error("Webhook Error:", err);
+    res.sendStatus(500);
   }
 });
 
-async function sendMessage(to, message) {
-  const token = process.env.WHATSAPP_TOKEN;
-  const apiUrl = `https://graph.facebook.com/v20.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+async function sendMsg91Message(to, message) {
+  const apiKey = process.env.MSG91_API_KEY;
 
-  await axios.post(apiUrl, {
-    messaging_product: "whatsapp",
-    to,
-    text: { body: message }
-  }, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json"
+  await axios.post(
+    "https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound",
+    {
+      to,
+      type: "text",
+      message
+    },
+    {
+      headers: {
+        authkey: apiKey,
+        "Content-Type": "application/json"
+      }
     }
-  });
+  );
 }
 
 export default router;
