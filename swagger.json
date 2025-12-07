@@ -1,21 +1,22 @@
 {
   "openapi": "3.0.0",
   "info": {
-    "title": "Mithil's Salon API",
+    "title": "Salon Chatbot Backend API",
     "version": "1.0.0",
-    "description": "API for managing salon users, admins, and appointments"
+    "description": "API documentation for the Salon Appointment Chatbot backend"
   },
 
   "servers": [
     {
-      "url": "https://aiagent-frontend.zasya.online"
+      "url": "https://aiagent-backend.zasya.online"
     }
   ],
 
   "paths": {
-    "/check-user": {
+    "/api/chat": {
       "post": {
-        "summary": "Check if user exists",
+        "summary": "Chatbot conversation endpoint",
+        "description": "Handles all user messages, login, booking, rescheduling, cancellations.",
         "requestBody": {
           "required": true,
           "content": {
@@ -23,64 +24,41 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "phone": { "type": "string" }
+                  "text": { "type": "string", "example": "Haircut" },
+                  "step": { "type": "string", "example": "bookService" },
+                  "phone": { "type": "string", "example": "9876543210" },
+                  "tempBooking": {
+                    "type": "object",
+                    "description": "Temporary appointment details"
+                  }
                 }
               }
             }
           }
         },
         "responses": {
-          "200": { "description": "User Found / Not Found" }
-        }
-      }
-    },
-
-    "/register": {
-      "post": {
-        "summary": "Register new user",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "phone": { "type": "string" },
-                  "name": { "type": "string" }
-                }
-              }
-            }
+          "200": {
+            "description": "Returns chatbot response object"
           }
-        },
-        "responses": {
-          "200": { "description": "User registered" }
         }
       }
     },
 
-    "/book-appointment": {
-      "post": {
-        "summary": "Book appointment",
+    "/webhook": {
+      "get": {
+        "summary": "Webhook verification",
+        "description": "Used for verifying WhatsApp webhook (Meta-style challenge verification).",
         "responses": {
-          "200": { "description": "Appointment booked" }
+          "200": { "description": "Verification successful" }
         }
-      }
-    },
-
-    "/get-appointments": {
+      },
       "post": {
-        "summary": "Get all user appointments",
+        "summary": "WhatsApp inbound messages webhook",
+        "description": "Receives WhatsApp messages from MSG91 or Meta and sends replies.",
         "responses": {
-          "200": { "description": "Appointment list" }
-        }
-      }
-    },
-
-    "/cancel-appointment": {
-      "post": {
-        "summary": "Cancel an appointment",
-        "responses": {
-          "200": { "description": "Appointment cancelled" }
+          "200": {
+            "description": "Webhook processed"
+          }
         }
       }
     }

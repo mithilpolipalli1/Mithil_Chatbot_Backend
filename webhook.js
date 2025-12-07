@@ -3,49 +3,59 @@ import axios from "axios";
 
 const router = express.Router();
 
-// MSG91 always sends POST → no verification required
-router.post("/webhook", async (req, res) => {
+// RAW MSG91 WEBHOOK RECEIVER
+router.post("/", async (req, res) => {
   try {
-    const data = req.body;
+    const incoming = req.body;
 
-    const from = data.sender;
-    const text = data.message;
+    // Extract message & sender number
+    const msg = incoming?.data?.message?.text;
+    const phone = incoming?.data?.message?.from;
 
-    // Send to your AI logic inside server.js
-    const botResponse = await axios.post("http://localhost:8011/api/chat", {
-      text,
-      phone: from
-    });
+    if (!msg || !phone) {
+      console.log("Webhook hit but no message.");
+      return res.sendStatus(200);
+    }
 
-    const reply = botResponse.data.reply;
+    console.log("📩 Incoming:", msg, "from", phone);
 
-    // Send reply back to MSG91 WhatsApp
-    await sendMsg91Message(from, reply);
+    // Forward to your chatbot
+    const botResponse = await axios.post(
+      `${process.env.BACKEND_PUBLIC_URL}/api/chat`,
+      {
+        text: msg,
+        phone: phone,
+        step: "phone", // auto detect
+      }
+    );
 
-    res.sendStatus(200);
+    const reply = botResponse.data?.reply || "Thank you!";
+
+    // Send reply using MSG91 API
+    await axios.post(
+      "https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound-message",
+      {
+        integrated_number: process.env.MSG91_INTEGRATED_NUMBER,
+        payload: {
+          messaging_product: "whatsapp",
+          to: phone,
+          type: "text",
+          text: { body: reply },
+        },
+      },
+      {
+        headers: {
+          authkey: process.env.MSG91_AUTHKEY,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    return res.sendStatus(200);
   } catch (err) {
-    console.error("Webhook Error:", err);
-    res.sendStatus(500);
+    console.error("❌ Webhook error:", err.message);
+    return res.sendStatus(500);
   }
 });
-
-async function sendMsg91Message(to, message) {
-  const apiKey = process.env.MSG91_API_KEY;
-
-  await axios.post(
-    "https://api.msg91.com/api/v5/whatsapp/whatsapp-outbound",
-    {
-      to,
-      type: "text",
-      message
-    },
-    {
-      headers: {
-        authkey: apiKey,
-        "Content-Type": "application/json"
-      }
-    }
-  );
-}
 
 export default router;
